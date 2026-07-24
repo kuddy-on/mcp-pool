@@ -711,7 +711,9 @@ const styles: Record<string, React.CSSProperties> = {
     backgroundColor: '#ffffff',
     border: '1px solid #cbd5e1',
     borderRadius: '5px',
-    padding: '2px 6px',
+    padding: '5px 10px',
+    height: '29px',
+    boxSizing: 'border-box',
   },
   langSelect: {
     border: 'none',
@@ -721,6 +723,8 @@ const styles: Record<string, React.CSSProperties> = {
     color: '#334155',
     cursor: 'pointer',
     outline: 'none',
+    lineHeight: '1',
+    padding: '0 2px',
   },
   grid: {
     display: 'grid',
