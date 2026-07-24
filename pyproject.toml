@@ -17,13 +17,12 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
-  "asyncpg>=0.30,<1",
+  "aiosqlite>=0.20,<1",
   "cryptography>=44,<47",
   "fastapi>=0.115,<1",
   "httpx[http2]>=0.28,<1",
   "prometheus-client>=0.21,<1",
   "pydantic-settings>=2.7,<3",
-  "redis>=5.2,<7",
   "sqlalchemy[asyncio]>=2.0,<3",
   "structlog>=24,<26",
   "typer>=0.15,<1",
