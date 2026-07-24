@@ -12,6 +12,7 @@ import {
   Play,
   Layers,
   Globe,
+  ChevronDown,
 } from 'lucide-react';
 
 type Lang = 'zh' | 'en';
@@ -154,6 +155,7 @@ interface TestResultItem {
 }
 
 export function App() {
+  const [showLangDropdown, setShowLangDropdown] = useState(false);
   const [lang, setLang] = useState<Lang>('zh');
   const t = translations[lang];
 
@@ -339,16 +341,45 @@ export function App() {
             </button>
           </div>
 
-          <div style={styles.langSelector}>
-            <Globe size={14} color="#64748b" />
-            <select
-              style={styles.langSelect}
-              value={lang}
-              onChange={(e) => setLang(e.target.value as Lang)}
+          <div style={{ position: 'relative' }}>
+            <button
+              style={styles.tab}
+              onClick={() => setShowLangDropdown((prev) => !prev)}
             >
-              <option value="zh">中文</option>
-              <option value="en">English</option>
-            </select>
+              <Globe size={14} color="#475569" />
+              <span>{lang === 'zh' ? '中文' : 'English'}</span>
+              <ChevronDown size={12} color="#64748b" />
+            </button>
+            {showLangDropdown && (
+              <div style={styles.customDropdownMenu}>
+                <div
+                  style={{
+                    ...styles.customDropdownItem,
+                    backgroundColor: lang === 'zh' ? '#f1f5f9' : '#ffffff',
+                    fontWeight: lang === 'zh' ? 600 : 400,
+                  }}
+                  onClick={() => {
+                    setLang('zh');
+                    setShowLangDropdown(false);
+                  }}
+                >
+                  中文
+                </div>
+                <div
+                  style={{
+                    ...styles.customDropdownItem,
+                    backgroundColor: lang === 'en' ? '#f1f5f9' : '#ffffff',
+                    fontWeight: lang === 'en' ? 600 : 400,
+                  }}
+                  onClick={() => {
+                    setLang('en');
+                    setShowLangDropdown(false);
+                  }}
+                >
+                  English
+                </div>
+              </div>
+            )}
           </div>
         </div>
       </header>
@@ -704,27 +735,25 @@ const styles: Record<string, React.CSSProperties> = {
     alignItems: 'center',
     gap: '4px',
   },
-  langSelector: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: '4px',
+  customDropdownMenu: {
+    position: 'absolute',
+    top: '100%',
+    right: 0,
+    marginTop: '4px',
     backgroundColor: '#ffffff',
     border: '1px solid #cbd5e1',
-    borderRadius: '5px',
-    padding: '5px 10px',
-    height: '29px',
-    boxSizing: 'border-box',
+    borderRadius: '6px',
+    boxShadow: '0 4px 12px rgba(0,0,0,0.1)',
+    zIndex: 100,
+    width: '100px',
+    overflow: 'hidden',
+    padding: '4px 0',
   },
-  langSelect: {
-    border: 'none',
-    backgroundColor: 'transparent',
+  customDropdownItem: {
+    padding: '6px 12px',
     fontSize: '12px',
-    fontWeight: 600,
-    color: '#334155',
+    color: '#0f172a',
     cursor: 'pointer',
-    outline: 'none',
-    lineHeight: '1',
-    padding: '0 2px',
   },
   grid: {
     display: 'grid',
