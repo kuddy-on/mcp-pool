@@ -1,12 +1,17 @@
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
+from uuid import uuid4
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 
-from mcp_pool import __version__
+from mcp_pool import __version__, admin_routes
+from mcp_pool.admin_routes import router as admin_router
 from mcp_pool.config import get_settings
+from mcp_pool.domain.admin import RequestLogItem
 from mcp_pool.pool import KeyPoolRegistry
 from mcp_pool.providers.base import ProviderSignalKind
 
@@ -27,6 +32,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     global pool_registry, http_client
     settings = get_settings()
     pool_registry = KeyPoolRegistry(settings.services)
+    admin_routes.registry = pool_registry
     http_client = httpx.AsyncClient(timeout=60.0)
     yield
     if http_client:
@@ -41,6 +47,9 @@ def create_app() -> FastAPI:
         description="Multi-account pooling and quota-aware routing gateway for MCP services.",
         lifespan=lifespan,
     )
+
+    # Mount admin API routes under /api/admin
+    app.include_router(admin_router)
 
     @app.get("/health/live", tags=["health"])
     async def liveness() -> dict[str, str]:
@@ -63,6 +72,8 @@ def create_app() -> FastAPI:
 
         body = await request.body()
         max_attempts = len(pool_manager.keys) or 1
+        failover_chain: list[str] = []
+        start_time = time.perf_counter()
 
         for _ in range(max_attempts):
             key = pool_manager.get_current_key()
@@ -78,7 +89,6 @@ def create_app() -> FastAPI:
             headers = pool_manager.provider_adapter.prepare_headers(
                 key.secret_key, httpx.Headers(request.headers)
             )
-            # Remove custom gateway routing header
             headers.pop("x-mcp-service", None)
 
             try:
@@ -92,6 +102,7 @@ def create_app() -> FastAPI:
 
                 signal = await pool_manager.provider_adapter.classify_response(upstream_resp)
                 pool_manager.mark_signal(key.key_id, signal.kind, signal.retry_at)
+                failover_chain.append(f"{key.name}:{signal.kind.value}")
 
                 if signal.kind in (
                     ProviderSignalKind.QUOTA_EXHAUSTED,
@@ -99,6 +110,22 @@ def create_app() -> FastAPI:
                 ):
                     await upstream_resp.aclose()
                     continue
+
+                duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+                pool_registry.add_log(
+                    RequestLogItem(
+                        id=str(uuid4()),
+                        service_name=pool_manager.service_name,
+                        timestamp=datetime.now(UTC),
+                        method=request.method,
+                        path=path,
+                        key_id=key.key_id,
+                        status_code=upstream_resp.status_code,
+                        signal_kind=signal.kind.value,
+                        duration_ms=duration_ms,
+                        failover_chain=failover_chain,
+                    )
+                )
 
                 resp_headers = dict(upstream_resp.headers)
                 resp_headers.pop("transfer-encoding", None)
@@ -111,6 +138,7 @@ def create_app() -> FastAPI:
                 )
             except httpx.RequestError:
                 pool_manager.mark_signal(key.key_id, ProviderSignalKind.UPSTREAM_UNHEALTHY)
+                failover_chain.append(f"{key.name}:unhealthy")
                 continue
 
         raise HTTPException(status_code=503, detail="All MCP API keys failed or quota exhausted")
