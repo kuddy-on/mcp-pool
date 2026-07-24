@@ -65,7 +65,7 @@ async def create_service(req: ServiceCreateRequest) -> ServiceResponse:
         auth_prefix=req.auth_prefix,
         api_keys=req.api_keys,
     )
-    mgr = reg.add_service(cfg)
+    mgr = await reg.add_service(cfg)
     return mgr.to_response()
 
 
@@ -97,7 +97,7 @@ async def update_service(service_id: str, req: ServiceUpdateRequest) -> ServiceR
 
 @router.delete("/services/{service_id}")
 async def delete_service(service_id: str) -> dict[str, str]:
-    if get_registry().remove_service(service_id):
+    if await get_registry().remove_service(service_id):
         return {"status": "ok"}
     raise HTTPException(status_code=404, detail="Service not found")
 
@@ -112,17 +112,19 @@ async def list_keys(service_id: str) -> list[KeyResponse]:
 
 @router.post("/services/{service_id}/keys", response_model=KeyResponse)
 async def add_key(service_id: str, req: KeyCreateRequest) -> KeyResponse:
-    mgr = get_registry().get_manager(service_id)
-    if not mgr:
+    reg = get_registry()
+    key = await reg.add_key_to_service(
+        service_id=service_id, secret_key=req.secret_key, name=req.name, weight=req.weight
+    )
+    if not key:
         raise HTTPException(status_code=404, detail="Service not found")
-
-    key = mgr.add_key(secret_key=req.secret_key, name=req.name, weight=req.weight)
     return key.to_response()
 
 
 @router.patch("/services/{service_id}/keys/{key_id}", response_model=KeyResponse)
 async def update_key(service_id: str, key_id: str, req: KeyUpdateRequest) -> KeyResponse:
-    mgr = get_registry().get_manager(service_id)
+    reg = get_registry()
+    mgr = reg.get_manager(service_id)
     if not mgr:
         raise HTTPException(status_code=404, detail="Service not found")
 
@@ -141,17 +143,15 @@ async def update_key(service_id: str, key_id: str, req: KeyUpdateRequest) -> Key
         if req.is_active:
             target_key.quota_exhausted = False
 
+    await reg.update_key_in_db(key_id, target_key)
     return target_key.to_response()
 
 
 @router.delete("/services/{service_id}/keys/{key_id}")
 async def delete_key(service_id: str, key_id: str) -> dict[str, str]:
-    mgr = get_registry().get_manager(service_id)
-    if not mgr:
-        raise HTTPException(status_code=404, detail="Service not found")
-
-    mgr.keys = [k for k in mgr.keys if k.key_id != key_id]
-    return {"status": "ok"}
+    if await get_registry().delete_key_from_db(service_id, key_id):
+        return {"status": "ok"}
+    raise HTTPException(status_code=404, detail="Service or Key not found")
 
 
 @router.post("/services/{service_id}/test", response_model=list[TestResultItem])
