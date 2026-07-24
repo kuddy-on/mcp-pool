@@ -4,6 +4,8 @@ from typing import Literal
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from mcp_pool.domain.service import ServiceConfig
+
 
 class Settings(BaseSettings):
     """Application settings loaded from MCP_POOL_* environment variables."""
@@ -19,9 +21,18 @@ class Settings(BaseSettings):
     port: int = 8000
     log_level: str = "INFO"
 
-    database_url: str = "postgresql+asyncpg://mcp_pool:mcp_pool@127.0.0.1:5432/mcp_pool"
-    redis_url: str = "redis://127.0.0.1:6379/0"
+    database_url: str = "sqlite+aiosqlite:///./mcp_pool.db"
     secret_key: SecretStr = SecretStr("development-only-secret")
+
+    # Generic MCP services configuration list
+    services: list[ServiceConfig] = [
+        ServiceConfig(
+            name="context7",
+            upstream_url="https://api.context7.com/mcp",
+            provider_type="context7",
+            api_keys=["key_1", "key_2"],
+        )
+    ]
 
 
 @lru_cache
