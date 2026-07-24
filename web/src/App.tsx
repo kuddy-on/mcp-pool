@@ -11,7 +11,101 @@ import {
   Trash2,
   Play,
   Layers,
+  Globe,
 } from 'lucide-react';
+
+type Lang = 'zh' | 'en';
+
+const translations = {
+  zh: {
+    title: 'MCPPool 网关控制台',
+    servicesTab: '服务与账号池',
+    logsTab: '实时日志',
+    mcpServices: 'MCP 服务列表',
+    addService: '添加服务',
+    upstream: '上游地址',
+    testConnection: '测试连接',
+    testing: '测试中...',
+    deleteService: '删除服务',
+    testResults: '连接测试结果',
+    accountPool: '账号池 / API 密钥',
+    addKey: '添加 Key',
+    thName: '名称',
+    thKeyMask: '密钥脱敏',
+    thStatus: '状态',
+    thRequests: '请求数',
+    thActions: '操作',
+    statusActive: '可用',
+    statusExhausted: '已耗尽',
+    statusPaused: '已暂停',
+    actionPause: '暂停',
+    actionResume: '恢复',
+    actionDelete: '删除',
+    liveLogsTitle: '实时请求日志与故障切换链路',
+    refreshLogs: '刷新日志',
+    thTime: '时间',
+    thService: '服务',
+    thMethodPath: '请求方法与路径',
+    thDuration: '耗时',
+    thFailoverChain: '故障切换链路',
+    modalAddServiceTitle: '新增 MCP 服务',
+    labelServiceName: '服务名称',
+    labelUpstreamUrl: '上游 Endpoint URL',
+    labelProviderType: 'Provider 类型',
+    btnCancel: '取消',
+    btnSaveService: '保存服务',
+    modalAddKeyTitle: '添加 Key 到密钥池',
+    labelKeyName: 'Key 名称 / 别名',
+    labelSecretKey: '密钥内容 (Secret API Key)',
+    btnAddKey: '添加 Key',
+    confirmDeleteService: '确定要删除该 MCP 服务吗？',
+    keysCount: '个可用 Key',
+  },
+  en: {
+    title: 'MCPPool Gateway Dashboard',
+    servicesTab: 'Services & Account Pools',
+    logsTab: 'Live Logs',
+    mcpServices: 'MCP Services',
+    addService: 'Add Service',
+    upstream: 'Upstream',
+    testConnection: 'Test Connection',
+    testing: 'Testing...',
+    deleteService: 'Delete Service',
+    testResults: 'Connection Test Results',
+    accountPool: 'Account Pool / API Keys',
+    addKey: 'Add Key',
+    thName: 'Name',
+    thKeyMask: 'Key Mask',
+    thStatus: 'Status',
+    thRequests: 'Requests',
+    thActions: 'Actions',
+    statusActive: 'Active',
+    statusExhausted: 'Exhausted',
+    statusPaused: 'Paused',
+    actionPause: 'Pause',
+    actionResume: 'Resume',
+    actionDelete: 'Delete',
+    liveLogsTitle: 'Live Request Logs & Failover Chains',
+    refreshLogs: 'Refresh Logs',
+    thTime: 'Time',
+    thService: 'Service',
+    thMethodPath: 'Method & Path',
+    thDuration: 'Duration',
+    thFailoverChain: 'Failover Chain',
+    modalAddServiceTitle: 'Add New MCP Service',
+    labelServiceName: 'Service Name',
+    labelUpstreamUrl: 'Upstream Endpoint URL',
+    labelProviderType: 'Provider Type',
+    btnCancel: 'Cancel',
+    btnSaveService: 'Save Service',
+    modalAddKeyTitle: 'Add Key to Pool',
+    labelKeyName: 'Key Name / Alias',
+    labelSecretKey: 'Secret API Key',
+    btnAddKey: 'Add Key',
+    confirmDeleteService: 'Are you sure you want to delete this MCP service?',
+    keysCount: 'Keys',
+  },
+};
 
 interface AccountKey {
   id: string;
@@ -60,6 +154,9 @@ interface TestResultItem {
 }
 
 export function App() {
+  const [lang, setLang] = useState<Lang>('zh');
+  const t = translations[lang];
+
   const [services, setServices] = useState<ServiceResponse[]>([]);
   const [selectedService, setSelectedService] = useState<ServiceResponse | null>(null);
   const [logs, setLogs] = useState<RequestLogItem[]>([]);
@@ -144,7 +241,7 @@ export function App() {
   };
 
   const handleDeleteService = async (serviceId: string) => {
-    if (!confirm('Are you sure you want to delete this MCP service?')) return;
+    if (!confirm(t.confirmDeleteService)) return;
     try {
       const res = await fetch(`/api/admin/services/${serviceId}`, { method: 'DELETE' });
       if (res.ok) {
@@ -223,22 +320,36 @@ export function App() {
     <div style={styles.container}>
       <header style={styles.header}>
         <div style={styles.brand}>
-          <ShieldCheck size={28} color="#4f46e5" />
-          <h1 style={styles.title}>MCPPool Gateway Dashboard</h1>
+          <ShieldCheck size={20} color="#4f46e5" />
+          <h1 style={styles.title}>{t.title}</h1>
         </div>
-        <div style={styles.navTabs}>
-          <button
-            style={activeTab === 'services' ? styles.tabActive : styles.tab}
-            onClick={() => setActiveTab('services')}
-          >
-            <Layers size={16} /> Services & Account Pools
-          </button>
-          <button
-            style={activeTab === 'logs' ? styles.tabActive : styles.tab}
-            onClick={() => setActiveTab('logs')}
-          >
-            <Activity size={16} /> Live Logs
-          </button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+          <div style={styles.navTabs}>
+            <button
+              style={activeTab === 'services' ? styles.tabActive : styles.tab}
+              onClick={() => setActiveTab('services')}
+            >
+              <Layers size={14} /> {t.servicesTab}
+            </button>
+            <button
+              style={activeTab === 'logs' ? styles.tabActive : styles.tab}
+              onClick={() => setActiveTab('logs')}
+            >
+              <Activity size={14} /> {t.logsTab}
+            </button>
+          </div>
+
+          <div style={styles.langSelector}>
+            <Globe size={14} color="#64748b" />
+            <select
+              style={styles.langSelect}
+              value={lang}
+              onChange={(e) => setLang(e.target.value as Lang)}
+            >
+              <option value="zh">中文</option>
+              <option value="en">English</option>
+            </select>
+          </div>
         </div>
       </header>
 
@@ -247,12 +358,12 @@ export function App() {
           {/* Left Panel: Services List */}
           <section style={styles.card}>
             <div style={styles.cardHeaderBetween}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                <Server size={20} color="#4f46e5" />
-                <h2 style={styles.cardTitle}>MCP Services</h2>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <Server size={16} color="#4f46e5" />
+                <h2 style={styles.cardTitle}>{t.mcpServices}</h2>
               </div>
               <button style={styles.btnPrimary} onClick={() => setShowAddServiceModal(true)}>
-                <Plus size={14} /> Add Service
+                <Plus size={12} /> {t.addService}
               </button>
             </div>
 
@@ -264,14 +375,14 @@ export function App() {
                     key={s.id}
                     style={{
                       ...styles.serviceItem,
-                      borderLeft: isSelected ? '4px solid #4f46e5' : '4px solid transparent',
-                      backgroundColor: isSelected ? '#f8fafc' : '#ffffff',
+                      borderLeft: isSelected ? '3px solid #4f46e5' : '3px solid transparent',
+                      backgroundColor: isSelected ? '#f1f5f9' : '#ffffff',
                     }}
                     onClick={() => setSelectedService(s)}
                   >
                     <div>
-                      <div style={{ fontWeight: 600 }}>{s.name}</div>
-                      <div style={{ fontSize: '12px', color: '#64748b' }}>{s.upstream_url}</div>
+                      <div style={{ fontWeight: 600, color: '#0f172a' }}>{s.name}</div>
+                      <div style={{ fontSize: '11px', color: '#64748b' }}>{s.upstream_url}</div>
                     </div>
                     <div style={{ textAlign: 'right' }}>
                       <span
@@ -283,10 +394,14 @@ export function App() {
                             : styles.statusExhausted
                         }
                       >
-                        {s.status}
+                        {s.status === 'active'
+                          ? t.statusActive
+                          : s.status === 'degraded'
+                          ? t.statusPaused
+                          : t.statusExhausted}
                       </span>
-                      <div style={{ fontSize: '11px', color: '#64748b', marginTop: '2px' }}>
-                        {s.active_keys} / {s.total_keys} Keys
+                      <div style={{ fontSize: '11px', color: '#64748b', marginTop: '1px' }}>
+                        {s.active_keys} / {s.total_keys} {t.keysCount}
                       </div>
                     </div>
                   </div>
@@ -300,31 +415,31 @@ export function App() {
             <section style={{ ...styles.card, flex: 2 }}>
               <div style={styles.cardHeaderBetween}>
                 <div>
-                  <h2 style={{ ...styles.cardTitle, fontSize: '18px' }}>{selectedService.name}</h2>
-                  <div style={{ fontSize: '13px', color: '#64748b' }}>
-                    Upstream: {selectedService.upstream_url}
+                  <h2 style={{ ...styles.cardTitle, fontSize: '15px' }}>{selectedService.name}</h2>
+                  <div style={{ fontSize: '12px', color: '#64748b' }}>
+                    {t.upstream}: {selectedService.upstream_url}
                   </div>
                 </div>
-                <div style={{ display: 'flex', gap: '8px' }}>
+                <div style={{ display: 'flex', gap: '6px' }}>
                   <button
                     style={styles.btnSecondary}
                     onClick={() => handleTestService(selectedService.id)}
                     disabled={testing}
                   >
-                    <Play size={14} /> {testing ? 'Testing...' : 'Test Connection'}
+                    <Play size={12} /> {testing ? t.testing : t.testConnection}
                   </button>
                   <button
                     style={styles.btnDanger}
                     onClick={() => handleDeleteService(selectedService.id)}
                   >
-                    <Trash2 size={14} /> Delete Service
+                    <Trash2 size={12} /> {t.deleteService}
                   </button>
                 </div>
               </div>
 
               {testResults && (
                 <div style={styles.testConsole}>
-                  <div style={{ fontWeight: 600, marginBottom: '8px' }}>Connection Test Results</div>
+                  <div style={{ fontWeight: 600, marginBottom: '6px' }}>{t.testResults}</div>
                   {testResults.map((tr, idx) => (
                     <div key={idx} style={styles.testItem}>
                       <span>{tr.step}:</span>
@@ -337,57 +452,57 @@ export function App() {
               )}
 
               {/* Account Pool / Keys */}
-              <div style={{ marginTop: '20px' }}>
+              <div style={{ marginTop: '14px' }}>
                 <div style={styles.cardHeaderBetween}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                    <Key size={18} color="#4f46e5" />
-                    <h3 style={{ fontSize: '15px', margin: 0 }}>Account Pool / API Keys</h3>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    <Key size={16} color="#4f46e5" />
+                    <h3 style={{ fontSize: '14px', margin: 0, color: '#0f172a' }}>{t.accountPool}</h3>
                   </div>
                   <button style={styles.btnPrimary} onClick={() => setShowAddKeyModal(true)}>
-                    <Plus size={14} /> Add Key
+                    <Plus size={12} /> {t.addKey}
                   </button>
                 </div>
 
                 <div style={styles.table}>
                   <div style={styles.tableHeader}>
-                    <div>Name</div>
-                    <div>Key Mask</div>
-                    <div>Status</div>
-                    <div>Requests</div>
-                    <div>Actions</div>
+                    <div>{t.thName}</div>
+                    <div>{t.thKeyMask}</div>
+                    <div>{t.thStatus}</div>
+                    <div>{t.thRequests}</div>
+                    <div>{t.thActions}</div>
                   </div>
                   {selectedService.keys.map((k) => (
                     <div key={k.id} style={styles.tableRow}>
-                      <div style={{ fontWeight: 600 }}>{k.name}</div>
-                      <div style={{ fontFamily: 'monospace', color: '#64748b' }}>{k.key_masked}</div>
+                      <div style={{ fontWeight: 600, color: '#0f172a' }}>{k.name}</div>
+                      <div style={{ fontFamily: 'monospace', color: '#475569' }}>{k.key_masked}</div>
                       <div>
                         {k.is_active && !k.quota_exhausted && (
                           <span style={styles.statusActive}>
-                            <CheckCircle size={14} /> Active
+                            <CheckCircle size={12} /> {t.statusActive}
                           </span>
                         )}
                         {k.quota_exhausted && (
                           <span style={styles.statusExhausted}>
-                            <XCircle size={14} /> Exhausted
+                            <XCircle size={12} /> {t.statusExhausted}
                           </span>
                         )}
                         {!k.is_active && !k.quota_exhausted && (
-                          <span style={styles.statusDegraded}>Paused</span>
+                          <span style={styles.statusDegraded}>{t.statusPaused}</span>
                         )}
                       </div>
-                      <div>{k.requests_count}</div>
-                      <div style={{ display: 'flex', gap: '8px' }}>
+                      <div style={{ color: '#0f172a' }}>{k.requests_count}</div>
+                      <div style={{ display: 'flex', gap: '6px' }}>
                         <button
                           style={styles.btnSmall}
                           onClick={() => handleToggleKey(k.id, k.is_active)}
                         >
-                          {k.is_active ? 'Pause' : 'Resume'}
+                          {k.is_active ? t.actionPause : t.actionResume}
                         </button>
                         <button
                           style={{ ...styles.btnSmall, color: '#ef4444' }}
                           onClick={() => handleDeleteKey(k.id)}
                         >
-                          Delete
+                          {t.actionDelete}
                         </button>
                       </div>
                     </div>
@@ -402,23 +517,23 @@ export function App() {
       {activeTab === 'logs' && (
         <section style={styles.card}>
           <div style={styles.cardHeaderBetween}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <Activity size={20} color="#4f46e5" />
-              <h2 style={styles.cardTitle}>Live Request Logs & Failover Chains</h2>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+              <Activity size={16} color="#4f46e5" />
+              <h2 style={styles.cardTitle}>{t.liveLogsTitle}</h2>
             </div>
             <button style={styles.btnSecondary} onClick={fetchLogs}>
-              <RefreshCw size={14} /> Refresh Logs
+              <RefreshCw size={12} /> {t.refreshLogs}
             </button>
           </div>
 
           <div style={styles.logTable}>
             <div style={styles.logHeader}>
-              <div>Time</div>
-              <div>Service</div>
-              <div>Method & Path</div>
-              <div>Status</div>
-              <div>Duration</div>
-              <div>Failover Chain</div>
+              <div>{t.thTime}</div>
+              <div>{t.thService}</div>
+              <div>{t.thMethodPath}</div>
+              <div>{t.thStatus}</div>
+              <div>{t.thDuration}</div>
+              <div>{t.thFailoverChain}</div>
             </div>
             {logs.map((log) => (
               <div key={log.id} style={styles.logRow}>
@@ -430,7 +545,7 @@ export function App() {
                 <div>
                   <span
                     style={{
-                      color: log.status_code < 400 ? '#22c55e' : '#ef4444',
+                      color: log.status_code < 400 ? '#16a34a' : '#dc2626',
                       fontWeight: 600,
                     }}
                   >
@@ -438,7 +553,7 @@ export function App() {
                   </span>
                 </div>
                 <div>{log.duration_ms} ms</div>
-                <div style={{ fontSize: '12px', color: '#64748b' }}>
+                <div style={{ fontSize: '11px', color: '#64748b' }}>
                   {log.failover_chain.join(' → ')}
                 </div>
               </div>
@@ -451,9 +566,9 @@ export function App() {
       {showAddServiceModal && (
         <div style={styles.modalOverlay}>
           <div style={styles.modal}>
-            <h3 style={{ marginTop: 0 }}>Add New MCP Service</h3>
+            <h3 style={{ marginTop: 0, fontSize: '15px', color: '#0f172a' }}>{t.modalAddServiceTitle}</h3>
             <div style={styles.formGroup}>
-              <label>Service Name</label>
+              <label style={styles.label}>{t.labelServiceName}</label>
               <input
                 style={styles.input}
                 value={newServiceName}
@@ -462,7 +577,7 @@ export function App() {
               />
             </div>
             <div style={styles.formGroup}>
-              <label>Upstream Endpoint URL</label>
+              <label style={styles.label}>{t.labelUpstreamUrl}</label>
               <input
                 style={styles.input}
                 value={newServiceUrl}
@@ -471,7 +586,7 @@ export function App() {
               />
             </div>
             <div style={styles.formGroup}>
-              <label>Provider Type</label>
+              <label style={styles.label}>{t.labelProviderType}</label>
               <select
                 style={styles.input}
                 value={newServiceProvider}
@@ -483,10 +598,10 @@ export function App() {
             </div>
             <div style={styles.modalActions}>
               <button style={styles.btnSecondary} onClick={() => setShowAddServiceModal(false)}>
-                Cancel
+                {t.btnCancel}
               </button>
               <button style={styles.btnPrimary} onClick={handleCreateService}>
-                Save Service
+                {t.btnSaveService}
               </button>
             </div>
           </div>
@@ -497,9 +612,9 @@ export function App() {
       {showAddKeyModal && (
         <div style={styles.modalOverlay}>
           <div style={styles.modal}>
-            <h3 style={{ marginTop: 0 }}>Add Key to Pool</h3>
+            <h3 style={{ marginTop: 0, fontSize: '15px', color: '#0f172a' }}>{t.modalAddKeyTitle}</h3>
             <div style={styles.formGroup}>
-              <label>Key Name / Alias</label>
+              <label style={styles.label}>{t.labelKeyName}</label>
               <input
                 style={styles.input}
                 value={newKeyName}
@@ -508,7 +623,7 @@ export function App() {
               />
             </div>
             <div style={styles.formGroup}>
-              <label>Secret API Key</label>
+              <label style={styles.label}>{t.labelSecretKey}</label>
               <input
                 type="password"
                 style={styles.input}
@@ -519,10 +634,10 @@ export function App() {
             </div>
             <div style={styles.modalActions}>
               <button style={styles.btnSecondary} onClick={() => setShowAddKeyModal(false)}>
-                Cancel
+                {t.btnCancel}
               </button>
               <button style={styles.btnPrimary} onClick={handleAddKey}>
-                Add Key
+                {t.btnAddKey}
               </button>
             </div>
           </div>
@@ -534,88 +649,113 @@ export function App() {
 
 const styles: Record<string, React.CSSProperties> = {
   container: {
-    fontFamily: 'Inter, system-ui, Avenir, Helvetica, Arial, sans-serif',
-    backgroundColor: '#f8fafc',
+    fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+    backgroundColor: '#f1f5f9',
     minHeight: '100vh',
-    padding: '24px',
+    padding: '16px 24px',
     color: '#0f172a',
   },
   header: {
     display: 'flex',
     justifyContent: 'space-between',
     alignItems: 'center',
-    marginBottom: '24px',
+    marginBottom: '16px',
+    paddingBottom: '12px',
+    borderBottom: '1px solid #cbd5e1',
   },
   brand: {
     display: 'flex',
     alignItems: 'center',
-    gap: '12px',
+    gap: '8px',
   },
   title: {
-    fontSize: '22px',
+    fontSize: '16px',
     fontWeight: 700,
+    color: '#0f172a',
     margin: 0,
   },
   navTabs: {
     display: 'flex',
-    gap: '8px',
+    gap: '6px',
   },
   tab: {
-    padding: '8px 16px',
-    borderRadius: '6px',
-    border: 'none',
-    backgroundColor: '#e2e8f0',
-    color: '#475569',
+    padding: '5px 12px',
+    borderRadius: '5px',
+    border: '1px solid #cbd5e1',
+    backgroundColor: '#ffffff',
+    color: '#334155',
+    fontSize: '12px',
     fontWeight: 600,
     cursor: 'pointer',
     display: 'flex',
     alignItems: 'center',
-    gap: '6px',
+    gap: '4px',
   },
   tabActive: {
-    padding: '8px 16px',
-    borderRadius: '6px',
-    border: 'none',
+    padding: '5px 12px',
+    borderRadius: '5px',
+    border: '1px solid #4f46e5',
     backgroundColor: '#4f46e5',
     color: '#ffffff',
+    fontSize: '12px',
     fontWeight: 600,
     cursor: 'pointer',
     display: 'flex',
     alignItems: 'center',
-    gap: '6px',
+    gap: '4px',
+  },
+  langSelector: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '4px',
+    backgroundColor: '#ffffff',
+    border: '1px solid #cbd5e1',
+    borderRadius: '5px',
+    padding: '2px 6px',
+  },
+  langSelect: {
+    border: 'none',
+    backgroundColor: 'transparent',
+    fontSize: '12px',
+    fontWeight: 600,
+    color: '#334155',
+    cursor: 'pointer',
+    outline: 'none',
   },
   grid: {
     display: 'grid',
-    gridTemplateColumns: '1fr 2.5fr',
-    gap: '24px',
+    gridTemplateColumns: '300px 1fr',
+    gap: '16px',
   },
   card: {
     backgroundColor: '#ffffff',
-    borderRadius: '12px',
-    padding: '20px',
-    boxShadow: '0 1px 3px rgba(0,0,0,0.1)',
+    borderRadius: '8px',
+    padding: '14px 16px',
+    border: '1px solid #e2e8f0',
+    boxShadow: '0 1px 2px rgba(0,0,0,0.05)',
   },
   cardHeaderBetween: {
     display: 'flex',
     justifyContent: 'space-between',
     alignItems: 'center',
-    marginBottom: '16px',
+    marginBottom: '12px',
   },
   cardTitle: {
-    fontSize: '16px',
-    fontWeight: 600,
+    fontSize: '14px',
+    fontWeight: 700,
+    color: '#0f172a',
     margin: 0,
   },
   serviceList: {
     display: 'flex',
     flexDirection: 'column',
-    gap: '8px',
+    gap: '6px',
   },
   serviceItem: {
     display: 'flex',
     justifyContent: 'space-between',
     alignItems: 'center',
-    padding: '12px',
+    padding: '8px 10px',
     borderRadius: '6px',
     border: '1px solid #e2e8f0',
     cursor: 'pointer',
@@ -623,103 +763,111 @@ const styles: Record<string, React.CSSProperties> = {
   table: {
     display: 'flex',
     flexDirection: 'column',
-    gap: '8px',
+    gap: '6px',
   },
   tableHeader: {
     display: 'grid',
-    gridTemplateColumns: '2fr 2fr 1.5fr 1fr 1.5fr',
-    padding: '8px 12px',
-    fontSize: '12px',
-    fontWeight: 600,
-    color: '#64748b',
+    gridTemplateColumns: '1.5fr 1.5fr 1fr 1fr 1.2fr',
+    padding: '6px 10px',
+    fontSize: '11px',
+    fontWeight: 700,
+    color: '#475569',
     textTransform: 'uppercase',
   },
   tableRow: {
     display: 'grid',
-    gridTemplateColumns: '2fr 2fr 1.5fr 1fr 1.5fr',
-    padding: '12px',
+    gridTemplateColumns: '1.5fr 1.5fr 1fr 1fr 1.2fr',
+    padding: '8px 10px',
     alignItems: 'center',
     borderRadius: '6px',
     border: '1px solid #e2e8f0',
+    fontSize: '12px',
   },
   statusActive: {
     display: 'inline-flex',
     alignItems: 'center',
     gap: '4px',
-    color: '#16a34a',
+    color: '#15803d',
     fontWeight: 600,
-    fontSize: '13px',
+    fontSize: '12px',
   },
   statusDegraded: {
     display: 'inline-flex',
     alignItems: 'center',
     gap: '4px',
-    color: '#d97706',
+    color: '#b45309',
     fontWeight: 600,
-    fontSize: '13px',
+    fontSize: '12px',
   },
   statusExhausted: {
     display: 'inline-flex',
     alignItems: 'center',
     gap: '4px',
-    color: '#dc2626',
+    color: '#b91c1c',
     fontWeight: 600,
-    fontSize: '13px',
+    fontSize: '12px',
   },
   btnPrimary: {
     backgroundColor: '#4f46e5',
     color: '#ffffff',
     border: 'none',
-    padding: '8px 14px',
-    borderRadius: '6px',
+    padding: '5px 10px',
+    borderRadius: '5px',
     fontWeight: 600,
-    fontSize: '13px',
+    fontSize: '12px',
     cursor: 'pointer',
     display: 'flex',
     alignItems: 'center',
     gap: '4px',
   },
   btnSecondary: {
-    backgroundColor: '#f1f5f9',
-    color: '#334155',
+    backgroundColor: '#ffffff',
+    color: '#1e293b',
     border: '1px solid #cbd5e1',
-    padding: '8px 14px',
-    borderRadius: '6px',
+    padding: '5px 10px',
+    borderRadius: '5px',
     fontWeight: 600,
-    fontSize: '13px',
+    fontSize: '12px',
     cursor: 'pointer',
     display: 'flex',
     alignItems: 'center',
     gap: '4px',
   },
   btnDanger: {
-    backgroundColor: '#ef4444',
+    backgroundColor: '#dc2626',
     color: '#ffffff',
     border: 'none',
-    padding: '8px 14px',
-    borderRadius: '6px',
+    padding: '5px 10px',
+    borderRadius: '5px',
     fontWeight: 600,
-    fontSize: '13px',
+    fontSize: '12px',
     cursor: 'pointer',
     display: 'flex',
     alignItems: 'center',
     gap: '4px',
   },
   btnSmall: {
-    padding: '4px 8px',
-    fontSize: '12px',
+    padding: '3px 8px',
+    fontSize: '11px',
     borderRadius: '4px',
     border: '1px solid #cbd5e1',
     backgroundColor: '#ffffff',
+    color: '#0f172a',
     cursor: 'pointer',
+    fontWeight: 500,
+  },
+  label: {
+    fontSize: '12px',
+    fontWeight: 600,
+    color: '#334155',
   },
   testConsole: {
     backgroundColor: '#0f172a',
     color: '#f8fafc',
-    padding: '12px',
+    padding: '10px 12px',
     borderRadius: '6px',
-    fontSize: '13px',
-    marginTop: '12px',
+    fontSize: '12px',
+    marginTop: '10px',
   },
   testItem: {
     display: 'flex',
@@ -729,25 +877,26 @@ const styles: Record<string, React.CSSProperties> = {
   logTable: {
     display: 'flex',
     flexDirection: 'column',
-    gap: '6px',
+    gap: '4px',
   },
   logHeader: {
     display: 'grid',
-    gridTemplateColumns: '1fr 1.5fr 2fr 1fr 1fr 3fr',
-    padding: '8px 12px',
-    fontSize: '12px',
-    fontWeight: 600,
-    color: '#64748b',
+    gridTemplateColumns: '1fr 1.2fr 1.8fr 1fr 1fr 2.5fr',
+    padding: '6px 10px',
+    fontSize: '11px',
+    fontWeight: 700,
+    color: '#475569',
     textTransform: 'uppercase',
   },
   logRow: {
     display: 'grid',
-    gridTemplateColumns: '1fr 1.5fr 2fr 1fr 1fr 3fr',
-    padding: '10px 12px',
+    gridTemplateColumns: '1fr 1.2fr 1.8fr 1fr 1fr 2.5fr',
+    padding: '8px 10px',
     borderRadius: '6px',
     border: '1px solid #e2e8f0',
-    fontSize: '13px',
+    fontSize: '12px',
     alignItems: 'center',
+    color: '#0f172a',
   },
   modalOverlay: {
     position: 'fixed',
@@ -755,35 +904,37 @@ const styles: Record<string, React.CSSProperties> = {
     left: 0,
     right: 0,
     bottom: 0,
-    backgroundColor: 'rgba(0,0,0,0.5)',
+    backgroundColor: 'rgba(15, 23, 42, 0.5)',
     display: 'flex',
     justifyContent: 'center',
     alignItems: 'center',
   },
   modal: {
     backgroundColor: '#ffffff',
-    borderRadius: '12px',
-    padding: '24px',
-    width: '400px',
-    boxShadow: '0 10px 25px rgba(0,0,0,0.2)',
+    borderRadius: '8px',
+    padding: '18px 20px',
+    width: '360px',
+    boxShadow: '0 10px 25px rgba(0,0,0,0.15)',
   },
   formGroup: {
-    marginBottom: '16px',
+    marginBottom: '12px',
     display: 'flex',
     flexDirection: 'column',
-    gap: '6px',
+    gap: '4px',
   },
   input: {
-    padding: '8px 12px',
-    borderRadius: '6px',
+    padding: '6px 10px',
+    borderRadius: '5px',
     border: '1px solid #cbd5e1',
-    fontSize: '14px',
+    fontSize: '13px',
+    color: '#0f172a',
+    backgroundColor: '#ffffff',
   },
   modalActions: {
     display: 'flex',
     justifyContent: 'flex-end',
-    gap: '8px',
-    marginTop: '20px',
+    gap: '6px',
+    marginTop: '16px',
   },
 };
 
