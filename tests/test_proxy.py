@@ -24,7 +24,7 @@ def test_key_pool_manager_rotation() -> None:
         provider_type="generic",
         api_keys=["key_1", "key_2"],
     )
-    manager = KeyPoolManager(service_cfg)
+    manager = KeyPoolManager("srv-uuid-1", service_cfg)
 
     k1 = manager.get_current_key()
     assert k1 is not None
