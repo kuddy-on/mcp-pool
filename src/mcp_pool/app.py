@@ -11,6 +11,7 @@ from fastapi.responses import StreamingResponse
 from mcp_pool import __version__, admin_routes
 from mcp_pool.admin_routes import router as admin_router
 from mcp_pool.config import get_settings
+from mcp_pool.db import init_db
 from mcp_pool.domain.admin import RequestLogItem
 from mcp_pool.pool import KeyPoolRegistry
 from mcp_pool.providers.base import ProviderSignalKind
@@ -30,8 +31,10 @@ async def _stream_response(response: httpx.Response) -> AsyncIterator[bytes]:
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     global pool_registry, http_client
+    await init_db()
     settings = get_settings()
     pool_registry = KeyPoolRegistry(settings.services)
+    await pool_registry.initialize()
     admin_routes.registry = pool_registry
     http_client = httpx.AsyncClient(timeout=60.0)
     yield
@@ -112,7 +115,7 @@ def create_app() -> FastAPI:
                     continue
 
                 duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
-                pool_registry.add_log(
+                await pool_registry.add_log(
                     RequestLogItem(
                         id=str(uuid4()),
                         service_name=pool_manager.service_name,
