@@ -33,7 +33,10 @@ async def login(req: LoginRequest) -> LoginResponse:
             )
 
         user_dto = UserDTO(id=user.id, username=user.username, role=user.role)
-        token = create_access_token(user_dto)
+        token = create_access_token(
+            user_dto,
+            token_version=user.token_version or 0,
+        )
 
         return LoginResponse(token=token, user=user_dto)
 
@@ -44,7 +47,15 @@ async def get_me(current_user: Annotated[UserDTO, Depends(get_current_user)]) ->
 
 
 @router.post("/auth/logout")
-async def logout(authorization: Annotated[str | None, Depends(get_current_user)]) -> dict[str, str]:
+async def logout(
+    current_user: Annotated[UserDTO, Depends(get_current_user)],
+) -> dict[str, str]:
+    async with async_session() as session:
+        result = await session.execute(select(UserModel).where(UserModel.id == current_user.id))
+        user = result.scalar_one_or_none()
+        if user is not None:
+            user.token_version = (user.token_version or 0) + 1
+            await session.commit()
     return {"status": "ok"}
 
 

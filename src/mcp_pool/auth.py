@@ -1,14 +1,33 @@
-import base64
 import hashlib
 import hmac
-import json
-import time
+from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
-from fastapi import Depends, Header, HTTPException, status
-from pydantic import BaseModel
+import jwt
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from jwt.exceptions import ExpiredSignatureError, InvalidTokenError
+from pydantic import BaseModel, ValidationError
+from sqlalchemy import select
 
 from mcp_pool.config import get_settings
+from mcp_pool.db import UserModel, async_session
+
+JWT_ALGORITHM = "HS256"
+JWT_ISSUER = "mcp-pool"
+JWT_AUDIENCE = "mcp-pool-api"
+JWT_KEY_CONTEXT = b"mcp-pool:jwt-signing:v1"
+REQUIRED_JWT_CLAIMS = [
+    "exp",
+    "iat",
+    "iss",
+    "aud",
+    "sub",
+    "username",
+    "role",
+    "token_version",
+]
+bearer_scheme = HTTPBearer(auto_error=False)
 
 
 class UserDTO(BaseModel):
@@ -33,6 +52,10 @@ class UserCreateRequest(BaseModel):
     role: str = "user"
 
 
+class AccessTokenClaims(UserDTO):
+    token_version: int
+
+
 def hash_password(password: str) -> str:
     settings = get_settings()
     salted = f"{password}:{settings.secret_key.get_secret_value()}"
@@ -40,102 +63,90 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return hash_password(plain_password) == hashed_password
+    return hmac.compare_digest(hash_password(plain_password), hashed_password)
 
 
-def _base64url_encode(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+def _jwt_signing_key() -> bytes:
+    application_secret = get_settings().secret_key.get_secret_value().encode("utf-8")
+    return hmac.new(application_secret, JWT_KEY_CONTEXT, hashlib.sha256).digest()
 
 
-def _base64url_decode(data_str: str) -> bytes:
-    padding = "=" * (4 - (len(data_str) % 4))
-    return base64.urlsafe_b64decode((data_str + padding).encode("ascii"))
-
-
-def create_access_token(user: UserDTO, expires_in_days: int = 30) -> str:
-    """Create a stateless HMAC-SHA256 JWT token."""
-    settings = get_settings()
-    secret = settings.secret_key.get_secret_value().encode("utf-8")
-
-    header = {"alg": "HS256", "typ": "JWT"}
+def create_access_token(
+    user: UserDTO,
+    *,
+    token_version: int,
+    expires_in_days: int = 30,
+) -> str:
+    """Create a signed access token with explicit issuer, audience, and expiry claims."""
+    now = datetime.now(UTC)
     payload = {
         "sub": user.id,
         "username": user.username,
         "role": user.role,
-        "exp": int(time.time()) + (expires_in_days * 86400),
+        "token_version": token_version,
+        "iat": now,
+        "exp": now + timedelta(days=expires_in_days),
+        "iss": JWT_ISSUER,
+        "aud": JWT_AUDIENCE,
     }
-
-    header_b64 = _base64url_encode(json.dumps(header).encode("utf-8"))
-    payload_b64 = _base64url_encode(json.dumps(payload).encode("utf-8"))
-    signing_input = f"{header_b64}.{payload_b64}".encode()
-
-    signature = hmac.new(secret, signing_input, hashlib.sha256).digest()
-    sig_b64 = _base64url_encode(signature)
-
-    return f"{header_b64}.{payload_b64}.{sig_b64}"
-
-
-def decode_access_token(token: str) -> UserDTO:
-    """Verify and decode a stateless HMAC-SHA256 JWT token."""
-    settings = get_settings()
-    secret = settings.secret_key.get_secret_value().encode("utf-8")
-
-    parts = token.split(".")
-    if len(parts) != 3:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token format",
-        )
-
-    header_b64, payload_b64, sig_b64 = parts
-    signing_input = f"{header_b64}.{payload_b64}".encode()
-    expected_sig = hmac.new(secret, signing_input, hashlib.sha256).digest()
-    actual_sig = _base64url_decode(sig_b64)
-
-    if not hmac.compare_digest(expected_sig, actual_sig):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token signature",
-        )
-
-    try:
-        payload = json.loads(_base64url_decode(payload_b64).decode("utf-8"))
-    except Exception as err:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token payload",
-        ) from err
-
-    if payload.get("exp") and time.time() > payload["exp"]:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token has expired",
-        )
-
-    return UserDTO(
-        id=payload["sub"],
-        username=payload["username"],
-        role=payload["role"],
+    return jwt.encode(
+        payload,
+        _jwt_signing_key(),
+        algorithm=JWT_ALGORITHM,
     )
 
 
-# Keep active_tokens for backwards compatibility in tests if referenced
-active_tokens: dict[str, UserDTO] = {}
+def _unauthorized(detail: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail=detail,
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 
-def get_current_user(authorization: Annotated[str | None, Header()] = None) -> UserDTO:
-    if not authorization:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing Authorization header",
+def decode_access_token(token: str) -> AccessTokenClaims:
+    """Verify a JWT using PyJWT and return its validated application claims."""
+    try:
+        payload = jwt.decode(
+            token,
+            _jwt_signing_key(),
+            algorithms=[JWT_ALGORITHM],
+            issuer=JWT_ISSUER,
+            audience=JWT_AUDIENCE,
+            options={"require": REQUIRED_JWT_CLAIMS},
         )
+        return AccessTokenClaims.model_validate(
+            {
+                "id": payload["sub"],
+                "username": payload["username"],
+                "role": payload["role"],
+                "token_version": payload["token_version"],
+            }
+        )
+    except ExpiredSignatureError as err:
+        raise _unauthorized("Token has expired") from err
+    except (InvalidTokenError, ValidationError) as err:
+        raise _unauthorized("Invalid access token") from err
 
-    token = authorization.replace("Bearer ", "").strip()
-    # First check active_tokens (in case legacy token used in tests)
-    if token in active_tokens:
-        return active_tokens[token]
-    # Stateless JWT decode
-    return decode_access_token(token)
+
+async def get_current_user(
+    credentials: Annotated[
+        HTTPAuthorizationCredentials | None,
+        Depends(bearer_scheme),
+    ],
+) -> UserDTO:
+    if credentials is None:
+        raise _unauthorized("Missing Authorization header")
+
+    claims = decode_access_token(credentials.credentials)
+    async with async_session() as session:
+        result = await session.execute(select(UserModel).where(UserModel.id == claims.id))
+        user = result.scalar_one_or_none()
+
+    if user is None or (user.token_version or 0) != claims.token_version:
+        raise _unauthorized("Access token has been revoked")
+
+    return UserDTO(id=user.id, username=user.username, role=user.role)
 
 
 def require_admin(user: Annotated[UserDTO, Depends(get_current_user)]) -> UserDTO:

@@ -20,6 +20,7 @@ class UserModel(Base):
     username: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     role: Mapped[str] = mapped_column(String(16), default="user")  # "admin" or "user"
+    token_version: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
 
     services: Mapped[list["ServiceModel"]] = relationship("ServiceModel", back_populates="owner")
@@ -124,6 +125,7 @@ async def init_db() -> None:
             "ALTER TABLE request_logs ADD COLUMN mcp_method VARCHAR(128)",
             "ALTER TABLE request_logs ADD COLUMN key_id VARCHAR(64)",
             "ALTER TABLE client_api_keys ADD COLUMN key_hint VARCHAR(32) DEFAULT ''",
+            "ALTER TABLE users ADD COLUMN token_version INTEGER DEFAULT 0",
         ]
         for stmt in migrations:
             with contextlib.suppress(Exception):
