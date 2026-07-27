@@ -7,6 +7,7 @@ class KeyCreateRequest(BaseModel):
     name: str
     secret_key: str
     weight: float = 1.0
+    monthly_quota: int = 0  # 0 = unlimited
 
 
 class KeyUpdateRequest(BaseModel):
@@ -14,6 +15,8 @@ class KeyUpdateRequest(BaseModel):
     secret_key: str | None = None
     weight: float | None = None
     is_active: bool | None = None
+    monthly_quota: int | None = None
+    used_this_month: int | None = None
 
 
 class KeyResponse(BaseModel):
@@ -27,6 +30,8 @@ class KeyResponse(BaseModel):
     fail_count: int = 0
     requests_count: int = 0
     last_used: datetime | None = None
+    monthly_quota: int = 0  # 0 = unlimited
+    used_this_month: int = 0
 
 
 class ServiceCreateRequest(BaseModel):
@@ -64,7 +69,11 @@ class RequestLogItem(BaseModel):
     timestamp: datetime
     method: str
     path: str
-    key_id: str | None
+    mcp_method: str | None = None
+    key_id: str | None = None
+    key_name: str | None = None
+    client_key_name: str | None = None
+    client_ip: str | None = None
     status_code: int
     signal_kind: str
     duration_ms: float
@@ -76,3 +85,23 @@ class TestResultItem(BaseModel):
     success: bool
     message: str
     duration_ms: float
+
+
+class ClientApiKeyResponse(BaseModel):
+    id: str
+    name: str
+    api_key_masked: str
+    is_active: bool
+    created_at: datetime
+
+
+class ClientApiKeyCreateRequest(BaseModel):
+    name: str
+
+
+class SystemSettingsResponse(BaseModel):
+    gateway_external_url: str
+
+
+class SystemSettingsUpdateRequest(BaseModel):
+    gateway_external_url: str

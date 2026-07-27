@@ -2,20 +2,23 @@
 
 > Multi-account pooling and quota-aware routing gateway for Model Context Protocol services.
 
-MCPPool exposes one stable MCP endpoint in front of multiple accounts for the same upstream service. It keeps sessions sticky, selects healthy accounts, pauses exhausted accounts, and safely fails over when an account becomes unavailable.
+MCPPool exposes one stable MCP endpoint in front of multiple API-key accounts for the same
+upstream service. It rotates eligible accounts, enforces configured monthly quotas, persists
+account health in SQLite, and fails over only when retrying is safe.
 
 > [!IMPORTANT]
-> MCPPool is in early development. The initial milestone focuses on Streamable HTTP, API-key accounts, session affinity, quota-aware routing, and Context7 as the first provider adapter.
+> MCPPool currently targets a simple single-node deployment backed by SQLite. Context7 is the
+> first provider adapter.
 
 ## Why MCPPool?
 
 A normal reverse proxy knows hosts and connections. MCPPool also understands:
 
 - MCP sessions and JSON-RPC method boundaries
-- accounts versus credentials
-- account health, concurrency, cooldowns, and quota reset times
-- session-affine account selection
-- safe versus unsafe cross-account retries
+- upstream accounts and encrypted credentials
+- account health, cooldowns, and configured monthly quotas
+- Gateway API-key authentication
+- safe versus ambiguous cross-account retries
 - provider-specific quota and authentication signals
 
 ## Architecture
@@ -23,25 +26,21 @@ A normal reverse proxy knows hosts and connections. MCPPool also understands:
 ```mermaid
 flowchart LR
     Client["MCP clients"] --> Gateway["MCPPool gateway"]
-    Gateway --> Session["Session resolver"]
-    Session --> Router["Account router"]
-    Router --> Broker["Credential broker"]
-    Broker --> A["Upstream account A"]
-    Broker --> B["Upstream account B"]
-    Broker --> C["Upstream account C"]
-
-    Gateway --> Classifier["Response classifier"]
-    Classifier --> Redis["Redis runtime state"]
-    Classifier --> Postgres["PostgreSQL source of truth"]
-    Worker["Recovery / refresh worker"] --> Redis
-    Worker --> Postgres
+    Admin["Admin dashboard"] --> Gateway
+    Gateway --> Auth["Client authentication"]
+    Auth --> Router["Quota-aware key router"]
+    Router --> A["Upstream account A"]
+    Router --> B["Upstream account B"]
+    Router --> C["Upstream account C"]
+    Gateway <--> SQLite["SQLite configuration, state, and audit log"]
 ```
 
-The project is split into three logical planes:
+The project has two logical paths:
 
-1. **Data plane** — authenticates clients, resolves sessions, selects an account, injects credentials, and streams the upstream response.
-2. **Control plane** — manages services, accounts, credentials, routing policies, quota state, and manual overrides.
-3. **Worker plane** — refreshes OAuth credentials, probes paused accounts, and reactivates accounts after quota resets.
+1. **Proxy path** — authenticates clients, selects an eligible account, injects its decrypted
+   credential, classifies the result, and streams the upstream response.
+2. **Administration path** — manages services, credentials, client keys, quotas, users, settings,
+   and request logs.
 
 ## Technology stack
 
@@ -50,28 +49,24 @@ The project is split into three logical planes:
 | Runtime | Python 3.12+ |
 | Dependency management | uv |
 | HTTP / ASGI | FastAPI, Starlette, Uvicorn |
-| Upstream transport | httpx with HTTP/2 and streaming |
-| MCP SDK | Official Python SDK v1.x, pinned below v2 |
-| Persistent state | PostgreSQL + SQLAlchemy async |
-| Runtime state | Redis |
+| Upstream transport | httpx streaming |
+| Persistent and runtime state | SQLite + SQLAlchemy async |
 | Validation / settings | Pydantic v2 + pydantic-settings |
-| Secrets | Envelope encryption using `cryptography` |
-| Observability | Prometheus metrics + structured logs + OpenTelemetry-ready boundaries |
+| Secrets | Fernet encryption for upstream keys; HMAC for Gateway keys |
+| Administration UI | React + Vite + nginx |
 | Quality | Ruff, mypy, pytest |
 
 See [docs/architecture.md](docs/architecture.md) and the [architecture decisions](docs/adr/) for the reasoning behind these choices.
 
 ## Routing model
 
-MCPPool treats an **account** as the quota owner and a **credential** as authentication material. Multiple credentials may belong to one account and still share the same upstream quota.
+Each configured API key is currently one independently routed account. Eligible keys are selected
+round-robin. A key is excluded when it is disabled, rejected by the upstream, inside a rate-limit
+cooldown, or at its configured monthly quota.
 
-The planned default routing policy is:
-
-- weighted rendezvous hashing for new sessions
-- session affinity for subsequent requests
-- least-inflight fallback for requests without a stable session key
-- automatic exclusion of paused, unhealthy, expired, or saturated accounts
-- provider-aware cooldown and quota reset handling
+Explicit upstream rejections (`401`, `403`, or `429`) may fail over to another account. Ambiguous
+failures such as connection loss or `5xx` responses are retried only for HTTP/MCP operations known
+to be read-only. `tools/call` is not replayed after an ambiguous failure.
 
 ## Development
 
@@ -79,20 +74,27 @@ Prerequisites:
 
 - Python 3.12+
 - uv
-- Docker with Compose, for PostgreSQL and Redis
+- Docker with Compose, when running the packaged gateway and dashboard
 
 ```bash
 cp .env.example .env
-docker compose up -d postgres redis
 uv sync --all-groups
 uv run mcp-pool serve --reload
+```
+
+Or run the complete local deployment:
+
+```bash
+docker compose up -d --build
 ```
 
 Then open:
 
 - `http://127.0.0.1:8000/health/live`
 - `http://127.0.0.1:8000/health/ready`
-- `http://127.0.0.1:8000/docs`
+- `http://127.0.0.1:8000/docs` for a direct development run
+- `http://127.0.0.1:3000` for the Docker dashboard
+- `http://127.0.0.1:8100/health/ready` for the Docker gateway
 
 Run checks:
 
@@ -106,19 +108,22 @@ uv run pytest
 ## Initial roadmap
 
 - [x] Repository and application skeleton
-- [ ] Streamable HTTP reverse proxy
-- [ ] Account and credential persistence
-- [ ] Session binding and weighted rendezvous routing
-- [ ] Quota classifier and account state machine
-- [ ] Context7 provider adapter
-- [ ] Prometheus metrics and request audit trail
-- [ ] OAuth refresh and recovery worker
-- [ ] Administration API and dashboard
+- [x] Streamable HTTP reverse proxy
+- [x] SQLite service, credential, state, and audit persistence
+- [x] Round-robin account routing with configured monthly quotas
+- [x] Context7 provider adapter
+- [x] Administration API and dashboard
+- [x] Gateway API-key authentication
+- [ ] Optional MCP session affinity
+- [ ] Metrics and retention controls
 
 ## Design principles
 
 - Preserve upstream MCP messages and streaming behavior whenever possible.
 - Never log raw credentials, authorization headers, or refresh tokens.
-- Persist long-lived quota pauses in PostgreSQL; Redis is an acceleration layer, not the source of truth.
-- Do not retry `tools/call` across accounts unless the tool is explicitly configured as idempotent.
+- Keep configuration, cooldowns, quota state, and audit records in SQLite.
+- Encrypt upstream credentials using `MCP_POOL_SECRET_KEY`; keep this value stable and backed up,
+  because losing it makes stored credentials unreadable.
+- Return Gateway API keys only once and store only their HMAC digest.
+- Do not retry `tools/call` after an ambiguous upstream outcome.
 - Keep provider-specific behavior behind adapters instead of embedding it in the router.

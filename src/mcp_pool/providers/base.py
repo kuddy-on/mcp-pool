@@ -1,5 +1,6 @@
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from enum import StrEnum
 from typing import Protocol
 
@@ -36,3 +37,22 @@ class ProviderAdapter(Protocol):
     async def classify_response(self, response: httpx.Response) -> ProviderSignal:
         """Translate provider-specific responses into gateway state signals."""
         ...
+
+
+def parse_retry_after(response: httpx.Response, default_seconds: float = 60.0) -> datetime:
+    """Parse Retry-After seconds or HTTP-date, with a bounded fallback cooldown."""
+    value = response.headers.get("retry-after")
+    now = datetime.now(UTC)
+    if value:
+        try:
+            seconds = max(0.0, min(float(value), 3600.0))
+            return now + timedelta(seconds=seconds)
+        except ValueError:
+            try:
+                parsed = parsedate_to_datetime(value)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=UTC)
+                return max(now, parsed.astimezone(UTC))
+            except (TypeError, ValueError, OverflowError):
+                pass
+    return now + timedelta(seconds=default_seconds)

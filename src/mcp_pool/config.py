@@ -25,14 +25,7 @@ class Settings(BaseSettings):
     secret_key: SecretStr = SecretStr("development-only-secret")
 
     # Generic MCP services configuration list
-    services: list[ServiceConfig] = [
-        ServiceConfig(
-            name="context7",
-            upstream_url="https://api.context7.com/mcp",
-            provider_type="context7",
-            api_keys=["key_1", "key_2"],
-        )
-    ]
+    services: list[ServiceConfig] = []
 
 
 @lru_cache

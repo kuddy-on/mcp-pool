@@ -1,8 +1,11 @@
-from datetime import UTC, datetime, timedelta
-
 import httpx
 
-from mcp_pool.providers.base import ProviderAdapter, ProviderSignal, ProviderSignalKind
+from mcp_pool.providers.base import (
+    ProviderAdapter,
+    ProviderSignal,
+    ProviderSignalKind,
+    parse_retry_after,
+)
 
 
 class GenericHeaderProviderAdapter(ProviderAdapter):
@@ -41,23 +44,15 @@ class GenericHeaderProviderAdapter(ProviderAdapter):
 
         if status in (401, 403):
             return ProviderSignal(
-                kind=ProviderSignalKind.QUOTA_EXHAUSTED,
-                reason=f"Auth error or quota limit reached ({status})",
+                kind=ProviderSignalKind.AUTH_INVALID,
+                reason=f"Authentication rejected ({status})",
                 authoritative=True,
             )
 
         if status == 429:
-            retry_after_str = response.headers.get("retry-after")
-            retry_at = None
-            if retry_after_str:
-                try:
-                    seconds = float(retry_after_str)
-                    retry_at = datetime.now(UTC) + timedelta(seconds=seconds)
-                except ValueError:
-                    pass
             return ProviderSignal(
                 kind=ProviderSignalKind.RATE_LIMITED,
-                retry_at=retry_at,
+                retry_at=parse_retry_after(response),
                 reason="Rate limited (429)",
                 authoritative=True,
             )

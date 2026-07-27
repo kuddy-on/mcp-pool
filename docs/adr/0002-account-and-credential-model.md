@@ -1,30 +1,27 @@
-# ADR 0002: Separate accounts from credentials
+# ADR 0002: One API key per routed account
 
-- Status: Accepted
-- Date: 2026-07-24
+- Status: Superseded for the SQLite deployment
+- Date: 2026-07-27
 
 ## Context
 
-Many upstream services allow one account to own multiple API keys or OAuth credentials while all of those credentials share the same subscription quota. Treating every key as an independent pool member would overestimate available quota and cause incorrect pause and recovery behavior.
+The original design separated accounts from credentials to model shared subscription quota. The
+current deployment is intentionally smaller and manages API keys directly.
 
 ## Decision
 
-Model accounts and credentials separately:
+Treat each configured API key as one routed account:
 
 ```text
 Service
-  -> Account       quota owner and routing unit
-       -> Credential   authentication material
-       -> Quota bucket
+  -> Account key   credential, routing state, and configured monthly quota
 ```
 
-Routing, concurrency, health, pause state, and quota exhaustion belong to the account. Credential records contain encrypted secrets, expiry, refresh metadata, and credential-specific validity.
-
-A provider adapter may explicitly declare a credential-scoped quota, but account scope is the default.
+The upstream secret is encrypted at rest. Availability, cooldown, provider rejection state, monthly
+quota, and manual usage offset are stored on the same SQLite record.
 
 ## Consequences
 
-- Multiple credentials can be rotated for security without manufacturing additional quota.
-- OAuth refresh failures can invalidate one credential without losing the account model.
-- Quota observations and reset timestamps remain attached to the correct owner.
-- The data model is slightly more complex than a flat API-key list, but it reflects real provider behavior.
+- The model and administration UI remain straightforward.
+- Quotas shared by several API keys must be apportioned manually between those keys.
+- OAuth credentials and refresh workflows are out of scope.
