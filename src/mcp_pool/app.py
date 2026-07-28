@@ -18,6 +18,7 @@ from mcp_pool.db import init_db
 from mcp_pool.domain.admin import RequestLogItem
 from mcp_pool.pool import KeyPoolManager, KeyPoolRegistry
 from mcp_pool.providers.base import ProviderSignalKind
+from mcp_pool.providers.context7 import Context7ProviderAdapter
 
 pool_registry: KeyPoolRegistry | None = None
 http_client: httpx.AsyncClient | None = None
@@ -197,8 +198,9 @@ async def proxy_request(
             break
         attempted_key_ids.add(key.key_id)
 
+        credential = key.secret_key
         headers = manager.provider_adapter.prepare_headers(
-            key.secret_key,
+            credential,
             httpx.Headers(request.headers),
         )
         headers.pop("x-mcp-service", None)
@@ -233,7 +235,19 @@ async def proxy_request(
             ) from exc
 
         signal = await manager.provider_adapter.classify_response(upstream_response)
-        await registry.record_signal(manager, key.key_id, signal.kind, signal.retry_at)
+        if key.secret_key == credential:
+            if isinstance(manager.provider_adapter, Context7ProviderAdapter):
+                manager.provider_adapter.capture_quota_response(
+                    key,
+                    upstream_response,
+                    expected_credential=credential,
+                )
+            await registry.record_signal(
+                manager,
+                key.key_id,
+                signal.kind,
+                signal.retry_at,
+            )
         failover_chain.append(f"{key.name}:{signal.kind.value}")
 
         if signal.kind in DEFINITIVE_REJECTION_SIGNALS:
