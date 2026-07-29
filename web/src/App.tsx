@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { Server, Trash2, Play, Layers, Globe, Lock, Users, LogOut, Clock, Plus } from 'lucide-react';
 import type {
   UserDTO,
@@ -67,9 +67,9 @@ export default function App() {
   const [testResults, setTestResults] = useState<TestResultItem[] | null>(null);
   const [testing, setTesting] = useState(false);
 
-  const authHeaders = (): HeadersInit => {
+  const authHeaders = useCallback((): HeadersInit => {
     return authToken ? { Authorization: `Bearer ${authToken}` } : {};
-  };
+  }, [authToken]);
 
   const checkMe = async () => {
     if (!authToken) return;

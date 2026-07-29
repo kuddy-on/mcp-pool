@@ -1,4 +1,5 @@
 import time
+from datetime import UTC, datetime
 from typing import Annotated, Any
 
 import httpx
@@ -19,9 +20,18 @@ from mcp_pool.domain.admin import (
     SystemSettingsUpdateRequest,
     TestResultItem,
 )
+from mcp_pool.domain.quota import ProviderQuotaServiceResponse
 from mcp_pool.domain.service import ServiceConfig
 from mcp_pool.pool import KeyPoolManager, KeyPoolRegistry
 from mcp_pool.providers.base import ProviderSignalKind
+from mcp_pool.providers.context7 import Context7ProviderAdapter
+from mcp_pool.quota import (
+    ProviderQuotaRefreshBatchTooLargeError,
+    ProviderQuotaRefreshCooldownError,
+    ProviderQuotaRefreshInProgressError,
+    get_provider_quota_status,
+    refresh_provider_quota_status,
+)
 
 router = APIRouter(
     prefix="/api/admin",
@@ -111,6 +121,63 @@ async def get_service(
     return mgr.to_response(usage)
 
 
+@router.get(
+    "/services/{service_id}/quota-status",
+    response_model=ProviderQuotaServiceResponse,
+)
+async def get_service_quota_status(
+    service_id: str,
+    user: Annotated[UserDTO, Depends(get_current_user)],
+) -> ProviderQuotaServiceResponse:
+    manager = get_authorized_manager(service_id, user, write=False)
+    can_refresh = user.role == "admin" or manager.owner_id == user.id
+    return get_provider_quota_status(manager, can_refresh=can_refresh)
+
+
+@router.post(
+    "/services/{service_id}/quota-status/refresh",
+    response_model=ProviderQuotaServiceResponse,
+)
+async def refresh_service_quota_status(
+    service_id: str,
+    user: Annotated[UserDTO, Depends(get_current_user)],
+    key_id: str | None = Query(default=None),
+) -> ProviderQuotaServiceResponse:
+    """Refresh Context7 quota.
+
+    Each selected Context7 key is checked with one official HEAD request. That
+    request consumes one unit, so returned remaining/used values are post-check.
+    """
+    manager = get_authorized_manager(service_id, user, write=True)
+    try:
+        return await refresh_provider_quota_status(
+            manager,
+            get_registry(),
+            key_id=key_id,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Key not found") from exc
+    except ProviderQuotaRefreshInProgressError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="A quota refresh is already in progress for a selected key",
+        ) from exc
+    except ProviderQuotaRefreshCooldownError as exc:
+        raise HTTPException(
+            status_code=429,
+            detail="Quota was queried too recently",
+            headers={"Retry-After": str(exc.retry_after)},
+        ) from exc
+    except ProviderQuotaRefreshBatchTooLargeError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Bulk quota refresh is limited to "
+                f"{exc.max_batch_size} keys; refresh a specific key instead"
+            ),
+        ) from exc
+
+
 @router.patch("/services/{service_id}", response_model=ServiceResponse)
 async def update_service(
     service_id: str,
@@ -191,24 +258,28 @@ async def update_key(
     if not target_key:
         raise HTTPException(status_code=404, detail="Key not found")
 
-    if req.name is not None:
-        target_key.name = req.name
-    if req.secret_key is not None:
-        target_key.secret_key = req.secret_key
-    if req.weight is not None:
-        target_key.weight = req.weight
-    if req.monthly_quota is not None:
-        target_key.monthly_quota = req.monthly_quota
-    if req.used_this_month is not None:
-        usage = await reg.get_monthly_usage()
-        log_count = usage.get(target_key.key_id, 0)
-        target_key.used_offset = req.used_this_month - log_count
-    if req.is_active is not None:
-        target_key.is_active = req.is_active
-        if req.is_active:
-            target_key.quota_exhausted = False
+    async with reg.provider_quota_state_lock(key_id):
+        if req.name is not None:
+            target_key.name = req.name
+        if req.secret_key is not None:
+            target_key.secret_key = req.secret_key
+            target_key.provider_quota_snapshot = None
+            target_key.provider_quota_error = None
+            await reg.reset_provider_quota_refresh_cooldown(key_id)
+        if req.weight is not None:
+            target_key.weight = req.weight
+        if req.monthly_quota is not None:
+            target_key.monthly_quota = req.monthly_quota
+        if req.used_this_month is not None:
+            usage = await reg.get_monthly_usage()
+            log_count = usage.get(target_key.key_id, 0)
+            target_key.used_offset = req.used_this_month - log_count
+        if req.is_active is not None:
+            target_key.is_active = req.is_active
+            if req.is_active:
+                target_key.quota_exhausted = False
 
-    await reg.update_key_in_db(key_id, target_key)
+        await reg.update_key_in_db(key_id, target_key)
     usage = await reg.get_monthly_usage()
     return target_key.to_response(usage)
 
@@ -292,8 +363,9 @@ async def test_key(
         raise HTTPException(status_code=404, detail="Key not found")
 
     start = time.perf_counter()
+    credential = target_key.secret_key
     headers = mgr.provider_adapter.prepare_headers(
-        target_key.secret_key, httpx.Headers({"accept": "application/json"})
+        credential, httpx.Headers({"accept": "application/json"})
     )
 
     try:
@@ -304,9 +376,31 @@ async def test_key(
                 headers=headers,
                 json={"jsonrpc": "2.0", "method": "ping", "id": 1},
             )
+            response_observed_at = datetime.now(UTC)
             duration = round((time.perf_counter() - start) * 1000, 2)
             signal = await mgr.provider_adapter.classify_response(resp)
-            await reg.record_signal(mgr, target_key.key_id, signal.kind, signal.retry_at)
+            if isinstance(mgr.provider_adapter, Context7ProviderAdapter):
+                async with reg.provider_quota_state_lock(target_key.key_id):
+                    if target_key.secret_key == credential:
+                        mgr.provider_adapter.capture_quota_response(
+                            target_key,
+                            resp,
+                            expected_credential=credential,
+                            observed_at=response_observed_at,
+                        )
+                        await reg.record_signal(
+                            mgr,
+                            target_key.key_id,
+                            signal.kind,
+                            signal.retry_at,
+                        )
+            elif target_key.secret_key == credential:
+                await reg.record_signal(
+                    mgr,
+                    target_key.key_id,
+                    signal.kind,
+                    signal.retry_at,
+                )
 
             if signal.kind == ProviderSignalKind.SUCCESS:
                 return TestResultItem(

@@ -18,6 +18,7 @@ from mcp_pool.db import init_db
 from mcp_pool.domain.admin import RequestLogItem
 from mcp_pool.pool import KeyPoolManager, KeyPoolRegistry
 from mcp_pool.providers.base import ProviderSignalKind
+from mcp_pool.providers.context7 import Context7ProviderAdapter
 
 pool_registry: KeyPoolRegistry | None = None
 http_client: httpx.AsyncClient | None = None
@@ -88,7 +89,25 @@ def is_probe_request(method: str, path: str, mcp_method: str | None = None) -> b
         return True
     if method == "GET" and clean_path in ("mcp", "health", ""):
         return True
-    return mcp_method in ("tools/list", "prompts/list", "resources/list", "initialize", "ping")
+    if method == "DELETE" and clean_path in ("mcp", ""):
+        return True
+    if mcp_method is not None and mcp_method.startswith("notifications/"):
+        return True
+    return mcp_method in (
+        "tools/list",
+        "prompts/list",
+        "resources/list",
+        "resources/templates/list",
+        "initialize",
+        "ping",
+    )
+
+
+def is_context7_quota_usage_request(mcp_method: str | None) -> bool:
+    """Whether one successful MCP request represents a Context7 documentation query."""
+    if mcp_method is None:
+        return False
+    return mcp_method.split(" (", 1)[0] == "tools/call"
 
 
 def is_ambiguous_retry_safe(http_method: str, mcp_method: str | None) -> bool:
@@ -197,8 +216,9 @@ async def proxy_request(
             break
         attempted_key_ids.add(key.key_id)
 
+        credential = key.secret_key
         headers = manager.provider_adapter.prepare_headers(
-            key.secret_key,
+            credential,
             httpx.Headers(request.headers),
         )
         headers.pop("x-mcp-service", None)
@@ -232,10 +252,44 @@ async def proxy_request(
                 "the operation may be non-idempotent",
             ) from exc
 
+        response_observed_at = datetime.now(UTC)
         signal = await manager.provider_adapter.classify_response(upstream_response)
-        await registry.record_signal(manager, key.key_id, signal.kind, signal.retry_at)
         failover_chain.append(f"{key.name}:{signal.kind.value}")
-
+        request_log_recorded = False
+        if isinstance(manager.provider_adapter, Context7ProviderAdapter):
+            async with registry.provider_quota_state_lock(key.key_id):
+                if key.secret_key == credential:
+                    manager.provider_adapter.capture_quota_response(
+                        key,
+                        upstream_response,
+                        expected_credential=credential,
+                        estimate_success_without_headers=(
+                            signal.kind == ProviderSignalKind.SUCCESS
+                            and is_context7_quota_usage_request(mcp_method)
+                        ),
+                        observed_at=response_observed_at,
+                    )
+                    await registry.record_signal(
+                        manager,
+                        key.key_id,
+                        signal.kind,
+                        signal.retry_at,
+                    )
+                    if signal.kind == ProviderSignalKind.SUCCESS:
+                        await add_request_log(
+                            key.key_id,
+                            key.name,
+                            upstream_response.status_code,
+                            signal.kind,
+                        )
+                        request_log_recorded = True
+        elif key.secret_key == credential:
+            await registry.record_signal(
+                manager,
+                key.key_id,
+                signal.kind,
+                signal.retry_at,
+            )
         if signal.kind in DEFINITIVE_REJECTION_SIGNALS:
             if signal.kind == ProviderSignalKind.RATE_LIMITED and signal.retry_at:
                 rate_limited_until.append(signal.retry_at)
@@ -248,12 +302,13 @@ async def proxy_request(
             await upstream_response.aclose()
             continue
 
-        await add_request_log(
-            key.key_id,
-            key.name,
-            upstream_response.status_code,
-            signal.kind,
-        )
+        if not request_log_recorded:
+            await add_request_log(
+                key.key_id,
+                key.name,
+                upstream_response.status_code,
+                signal.kind,
+            )
         return StreamingResponse(
             content=_stream_response(upstream_response),
             status_code=upstream_response.status_code,

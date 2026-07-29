@@ -163,6 +163,57 @@ async def test_proxy_end_to_end_generic_failover() -> None:
 
 
 @pytest.mark.asyncio
+async def test_context7_success_log_includes_attempt_in_failover_chain() -> None:
+    app = create_app()
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"jsonrpc": "2.0", "result": {}, "id": 1})
+
+    async with lifespan(app):
+        import mcp_pool.app as app_module
+
+        assert app_module.http_client is not None
+        await app_module.http_client.aclose()
+        app_module.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        assert app_module.pool_registry is not None
+        service_name = f"context7_log_{uuid4().hex[:6]}"
+        await app_module.pool_registry.add_service(
+            ServiceConfig(
+                name=service_name,
+                upstream_url="https://api.context7.com/mcp",
+                provider_type="context7",
+                api_keys=["context7-key"],
+            )
+        )
+        _, gateway_key = await app_module.pool_registry.create_client_api_key(
+            f"context7-log-test-{uuid4().hex[:6]}"
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.post(
+                f"/s/{service_name}/mcp",
+                headers={"Authorization": f"Bearer {gateway_key}"},
+                json={
+                    "jsonrpc": "2.0",
+                    "method": "tools/call",
+                    "params": {"name": "query-docs", "arguments": {}},
+                    "id": 1,
+                },
+            )
+
+        assert response.status_code == 200
+        logs = app_module.pool_registry.get_logs(
+            limit=10,
+            service_names={service_name},
+        )
+        assert len(logs) == 1
+        assert logs[0].failover_chain == ["Key-1:success"]
+
+
+@pytest.mark.asyncio
 async def test_proxy_requires_gateway_key_on_both_routes() -> None:
     app = create_app()
 

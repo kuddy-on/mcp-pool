@@ -60,6 +60,8 @@ class AccountKeyModel(Base):
     last_used: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     monthly_quota: Mapped[int] = mapped_column(Integer, default=0)  # 0 = unlimited
     used_offset: Mapped[int] = mapped_column(Integer, default=0)  # manual offset
+    provider_quota_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
+    provider_quota_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     service: Mapped[ServiceModel] = relationship("ServiceModel", back_populates="keys")
 
@@ -122,6 +124,8 @@ async def init_db() -> None:
             "ALTER TABLE request_logs ADD COLUMN client_ip VARCHAR(64)",
             "ALTER TABLE account_keys ADD COLUMN monthly_quota INTEGER DEFAULT 0",
             "ALTER TABLE account_keys ADD COLUMN used_offset INTEGER DEFAULT 0",
+            "ALTER TABLE account_keys ADD COLUMN provider_quota_snapshot TEXT",
+            "ALTER TABLE account_keys ADD COLUMN provider_quota_error TEXT",
             "ALTER TABLE request_logs ADD COLUMN mcp_method VARCHAR(128)",
             "ALTER TABLE request_logs ADD COLUMN key_id VARCHAR(64)",
             "ALTER TABLE client_api_keys ADD COLUMN key_hint VARCHAR(32) DEFAULT ''",

@@ -1,4 +1,7 @@
+import asyncio
 import json
+import math
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -29,6 +32,8 @@ from mcp_pool.providers.base import ProviderAdapter, ProviderSignalKind
 from mcp_pool.providers.context7 import Context7ProviderAdapter
 from mcp_pool.providers.generic import GenericHeaderProviderAdapter
 
+PROVIDER_QUOTA_MAX_CONCURRENCY = 5
+
 
 @dataclass
 class AccountKey:
@@ -44,6 +49,8 @@ class AccountKey:
     last_used: datetime | None = None
     monthly_quota: int = 0  # 0 = unlimited
     used_offset: int = 0  # manual offset for external usage
+    provider_quota_snapshot: str | None = None
+    provider_quota_error: str | None = None
 
     def is_available(self, now: datetime | None = None, used_this_month: int = 0) -> bool:
         current_time = now or datetime.now(UTC)
@@ -216,6 +223,60 @@ class KeyPoolRegistry:
         self._logs: list[RequestLogItem] = []
         self.gateway_external_url: str = "http://localhost:8100"
         self._client_keys: dict[str, str] = {}  # HMAC digest -> display name
+        self.provider_quota_refresh_semaphore = asyncio.Semaphore(PROVIDER_QUOTA_MAX_CONCURRENCY)
+        self._provider_quota_refresh_claim_lock = asyncio.Lock()
+        self._provider_quota_refresh_inflight: set[str] = set()
+        self._provider_quota_refresh_last_started: dict[str, float] = {}
+        self._provider_quota_state_locks: dict[str, asyncio.Lock] = {}
+
+    def provider_quota_state_lock(self, key_id: str) -> asyncio.Lock:
+        """Return the single-process lock protecting one key's quota state and persistence."""
+        lock = self._provider_quota_state_locks.get(key_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._provider_quota_state_locks[key_id] = lock
+        return lock
+
+    async def claim_provider_quota_refresh(
+        self,
+        key_ids: Sequence[str],
+        *,
+        cooldown_seconds: float,
+    ) -> tuple[str, int]:
+        """Atomically reserve keys for one quota refresh request.
+
+        Returns ``("acquired", 0)``, ``("in_progress", 0)``, or
+        ``("cooldown", retry_after_seconds)``.
+        """
+        async with self._provider_quota_refresh_claim_lock:
+            if any(key_id in self._provider_quota_refresh_inflight for key_id in key_ids):
+                return "in_progress", 0
+
+            now = time.monotonic()
+            retry_after = max(
+                (
+                    cooldown_seconds
+                    - (now - self._provider_quota_refresh_last_started.get(key_id, -math.inf))
+                    for key_id in key_ids
+                ),
+                default=0.0,
+            )
+            if retry_after > 0:
+                return "cooldown", max(1, math.ceil(retry_after))
+
+            self._provider_quota_refresh_inflight.update(key_ids)
+            for key_id in key_ids:
+                self._provider_quota_refresh_last_started[key_id] = now
+            return "acquired", 0
+
+    async def release_provider_quota_refresh(self, key_ids: Sequence[str]) -> None:
+        async with self._provider_quota_refresh_claim_lock:
+            self._provider_quota_refresh_inflight.difference_update(key_ids)
+
+    async def reset_provider_quota_refresh_cooldown(self, key_id: str) -> None:
+        """Allow a newly replaced credential to be queried after old work finishes."""
+        async with self._provider_quota_refresh_claim_lock:
+            self._provider_quota_refresh_last_started.pop(key_id, None)
 
     async def initialize(self) -> None:
         """Load persistent records from SQLite DB or seed default admin user."""
@@ -351,6 +412,12 @@ class KeyPoolRegistry:
                                 last_used=key_model.last_used,
                                 monthly_quota=getattr(key_model, "monthly_quota", 0) or 0,
                                 used_offset=getattr(key_model, "used_offset", 0) or 0,
+                                provider_quota_snapshot=getattr(
+                                    key_model, "provider_quota_snapshot", None
+                                ),
+                                provider_quota_error=getattr(
+                                    key_model, "provider_quota_error", None
+                                ),
                             )
                         )
                     self._managers[db_s.name] = mgr
@@ -502,7 +569,34 @@ class KeyPoolRegistry:
                 km.last_used = account_key.last_used
                 km.monthly_quota = account_key.monthly_quota
                 km.used_offset = account_key.used_offset
+                km.provider_quota_snapshot = account_key.provider_quota_snapshot
+                km.provider_quota_error = account_key.provider_quota_error
                 await session.commit()
+
+    async def update_provider_quota_states_in_db(
+        self,
+        account_keys: Sequence[AccountKey],
+    ) -> None:
+        """Persist provider quota metadata and its synchronized local usage offset."""
+        if not account_keys:
+            return
+        states = {
+            key.key_id: (
+                key.provider_quota_snapshot,
+                key.provider_quota_error,
+                key.used_offset,
+            )
+            for key in account_keys
+        }
+        async with async_session() as session:
+            stmt = select(AccountKeyModel).where(AccountKeyModel.id.in_(states))
+            res = await session.execute(stmt)
+            for key_model in res.scalars().all():
+                snapshot, error, used_offset = states[key_model.id]
+                key_model.provider_quota_snapshot = snapshot
+                key_model.provider_quota_error = error
+                key_model.used_offset = used_offset
+            await session.commit()
 
     async def record_signal(
         self,

@@ -68,6 +68,42 @@ Explicit upstream rejections (`401`, `403`, or `429`) may fail over to another a
 failures such as connection loss or `5xx` responses are retried only for HTTP/MCP operations known
 to be read-only. `tools/call` is not replayed after an ambiguous failure.
 
+## Context7 quota status
+
+For Context7 services, the account table can display the upstream request limit, used and
+remaining requests, reset time, snapshot age, and the latest safe error state for every key. These
+values are kept separate from MCPPool's locally configured `monthly_quota` and request-log count.
+
+When a successful Context7 `tools/call` response includes complete `RateLimit-Limit`,
+`RateLimit-Remaining`, and `RateLimit-Reset` headers, MCPPool stores those official values. When
+Context7 omits the headers, MCPPool advances an existing, unexpired official snapshot by one and
+marks the displayed value as a local estimate. Handshake, notification, discovery, and session
+close requests are not added. The dashboard polls only MCPPool's persisted state, so leaving the
+page open does not consume Context7 quota.
+
+Click **Query now** to establish or calibrate the official baseline, including usage made outside
+MCPPool. The fixed official HEAD query consumes one Context7 request itself, and the UI confirms
+that cost before sending it. A successful query also recalculates the local manual offset so the
+separate **Local Usage / Manual Quota** column matches the effective official used value at that
+moment. A failed query leaves the previous offset unchanged.
+
+A local estimate cannot be shown before the first successful official query. After the saved reset
+time, the old value remains visible as stale but receives no further local increments until another
+official query establishes the new period.
+
+Administration endpoints:
+
+- `GET /api/admin/services/{service_id}/quota-status` reads the saved snapshot without contacting
+  Context7.
+- `POST /api/admin/services/{service_id}/quota-status/refresh?key_id={key_id}` refreshes one key.
+  Omitting `key_id` refreshes up to 20 keys in that Context7 service with globally bounded
+  concurrency. Per-key singleflight and a short cooldown prevent duplicate refreshes from
+  consuming quota.
+
+Context7's web-only teamspace statistics endpoint requires a privileged browser session and does
+not accept the `ctx7sk-*` API keys stored by MCPPool. MCPPool therefore never stores Context7
+browser cookies, account passwords, or billing-session credentials.
+
 ## Development
 
 Prerequisites:

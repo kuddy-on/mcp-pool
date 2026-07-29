@@ -34,6 +34,36 @@ export interface ServiceResponse {
   keys: AccountKey[];
 }
 
+export type ProviderQuotaKeyState =
+  | 'ok'
+  | 'exhausted'
+  | 'unknown'
+  | 'auth_invalid'
+  | 'error';
+
+export interface ProviderQuotaKeyStatus {
+  key_id: string;
+  status: ProviderQuotaKeyState;
+  used: number | null;
+  limit: number | null;
+  remaining: number | null;
+  reset_at: string | null;
+  last_success_at: string | null;
+  last_attempt_at: string | null;
+  stale: boolean;
+  estimated: boolean;
+  error_code: string | null;
+}
+
+export interface ServiceQuotaStatusResponse {
+  service_id: string;
+  provider_type: string;
+  supported: boolean;
+  can_refresh: boolean;
+  status: 'unsupported' | 'unknown' | 'ok' | 'partial' | 'exhausted' | 'error' | string;
+  keys: ProviderQuotaKeyStatus[];
+}
+
 export interface RequestLogItem {
   id: string;
   service_name: string;
