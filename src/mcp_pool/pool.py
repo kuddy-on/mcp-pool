@@ -227,6 +227,15 @@ class KeyPoolRegistry:
         self._provider_quota_refresh_claim_lock = asyncio.Lock()
         self._provider_quota_refresh_inflight: set[str] = set()
         self._provider_quota_refresh_last_started: dict[str, float] = {}
+        self._provider_quota_state_locks: dict[str, asyncio.Lock] = {}
+
+    def provider_quota_state_lock(self, key_id: str) -> asyncio.Lock:
+        """Return the single-process lock protecting one key's quota state and persistence."""
+        lock = self._provider_quota_state_locks.get(key_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._provider_quota_state_locks[key_id] = lock
+        return lock
 
     async def claim_provider_quota_refresh(
         self,
@@ -568,20 +577,25 @@ class KeyPoolRegistry:
         self,
         account_keys: Sequence[AccountKey],
     ) -> None:
-        """Persist provider quota metadata without changing routing state."""
+        """Persist provider quota metadata and its synchronized local usage offset."""
         if not account_keys:
             return
         states = {
-            key.key_id: (key.provider_quota_snapshot, key.provider_quota_error)
+            key.key_id: (
+                key.provider_quota_snapshot,
+                key.provider_quota_error,
+                key.used_offset,
+            )
             for key in account_keys
         }
         async with async_session() as session:
             stmt = select(AccountKeyModel).where(AccountKeyModel.id.in_(states))
             res = await session.execute(stmt)
             for key_model in res.scalars().all():
-                snapshot, error = states[key_model.id]
+                snapshot, error, used_offset = states[key_model.id]
                 key_model.provider_quota_snapshot = snapshot
                 key_model.provider_quota_error = error
+                key_model.used_offset = used_offset
             await session.commit()
 
     async def record_signal(

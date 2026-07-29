@@ -1,4 +1,5 @@
 import time
+from datetime import UTC, datetime
 from typing import Annotated, Any
 
 import httpx
@@ -257,27 +258,28 @@ async def update_key(
     if not target_key:
         raise HTTPException(status_code=404, detail="Key not found")
 
-    if req.name is not None:
-        target_key.name = req.name
-    if req.secret_key is not None:
-        target_key.secret_key = req.secret_key
-        target_key.provider_quota_snapshot = None
-        target_key.provider_quota_error = None
-        await reg.reset_provider_quota_refresh_cooldown(key_id)
-    if req.weight is not None:
-        target_key.weight = req.weight
-    if req.monthly_quota is not None:
-        target_key.monthly_quota = req.monthly_quota
-    if req.used_this_month is not None:
-        usage = await reg.get_monthly_usage()
-        log_count = usage.get(target_key.key_id, 0)
-        target_key.used_offset = req.used_this_month - log_count
-    if req.is_active is not None:
-        target_key.is_active = req.is_active
-        if req.is_active:
-            target_key.quota_exhausted = False
+    async with reg.provider_quota_state_lock(key_id):
+        if req.name is not None:
+            target_key.name = req.name
+        if req.secret_key is not None:
+            target_key.secret_key = req.secret_key
+            target_key.provider_quota_snapshot = None
+            target_key.provider_quota_error = None
+            await reg.reset_provider_quota_refresh_cooldown(key_id)
+        if req.weight is not None:
+            target_key.weight = req.weight
+        if req.monthly_quota is not None:
+            target_key.monthly_quota = req.monthly_quota
+        if req.used_this_month is not None:
+            usage = await reg.get_monthly_usage()
+            log_count = usage.get(target_key.key_id, 0)
+            target_key.used_offset = req.used_this_month - log_count
+        if req.is_active is not None:
+            target_key.is_active = req.is_active
+            if req.is_active:
+                target_key.quota_exhausted = False
 
-    await reg.update_key_in_db(key_id, target_key)
+        await reg.update_key_in_db(key_id, target_key)
     usage = await reg.get_monthly_usage()
     return target_key.to_response(usage)
 
@@ -374,15 +376,25 @@ async def test_key(
                 headers=headers,
                 json={"jsonrpc": "2.0", "method": "ping", "id": 1},
             )
+            response_observed_at = datetime.now(UTC)
             duration = round((time.perf_counter() - start) * 1000, 2)
             signal = await mgr.provider_adapter.classify_response(resp)
-            if target_key.secret_key == credential:
-                if isinstance(mgr.provider_adapter, Context7ProviderAdapter):
-                    mgr.provider_adapter.capture_quota_response(
-                        target_key,
-                        resp,
-                        expected_credential=credential,
-                    )
+            if isinstance(mgr.provider_adapter, Context7ProviderAdapter):
+                async with reg.provider_quota_state_lock(target_key.key_id):
+                    if target_key.secret_key == credential:
+                        mgr.provider_adapter.capture_quota_response(
+                            target_key,
+                            resp,
+                            expected_credential=credential,
+                            observed_at=response_observed_at,
+                        )
+                        await reg.record_signal(
+                            mgr,
+                            target_key.key_id,
+                            signal.kind,
+                            signal.retry_at,
+                        )
+            elif target_key.secret_key == credential:
                 await reg.record_signal(
                     mgr,
                     target_key.key_id,

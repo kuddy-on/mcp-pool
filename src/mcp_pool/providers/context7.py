@@ -111,15 +111,20 @@ class Context7ProviderAdapter(ProviderAdapter):
         response: httpx.Response,
         *,
         expected_credential: str,
-    ) -> None:
+        estimate_success_without_headers: bool = False,
+        observed_at: datetime | None = None,
+    ) -> bool:
         """Apply quota metadata from a request that was already sent.
 
         The credential comparison prevents a response from an in-flight request from
-        overwriting quota state after an administrator has replaced the key.
+        overwriting quota state after an administrator has replaced the key. Successful
+        non-probe proxy requests may advance an existing official snapshot locally when
+        Context7 omits quota headers from the MCP response.
         """
         if response.status_code in (401, 403):
             result: ProviderQuotaSnapshot | ProviderQuotaError = parse_context7_quota_response(
-                response
+                response,
+                checked_at=observed_at,
             )
         elif response.status_code == 429 or 200 <= response.status_code < 300:
             required_headers = (
@@ -128,16 +133,56 @@ class Context7ProviderAdapter(ProviderAdapter):
                 "ratelimit-reset",
             )
             if any(response.headers.get(name) is None for name in required_headers):
-                return
-            result = parse_context7_quota_response(response)
+                if estimate_success_without_headers and 200 <= response.status_code < 300:
+                    return self.increment_quota_usage(
+                        key,
+                        expected_credential=expected_credential,
+                        observed_at=observed_at,
+                    )
+                return False
+            result = parse_context7_quota_response(
+                response,
+                checked_at=observed_at,
+            )
         else:
-            return
+            return False
 
-        self.apply_quota_result(
+        return self.apply_quota_result(
             key,
             result,
             expected_credential=expected_credential,
         )
+
+    def increment_quota_usage(
+        self,
+        key: AccountKey,
+        *,
+        expected_credential: str,
+        observed_at: datetime | None = None,
+    ) -> bool:
+        """Advance a current-period snapshot after one successful charged request.
+
+        The official check time is intentionally preserved: this value is an estimate
+        based on a previously observed snapshot, not a new provider observation.
+        """
+        if key.secret_key != expected_credential:
+            return False
+
+        snapshot = _load_snapshot(key.provider_quota_snapshot)
+        if snapshot is None:
+            return False
+
+        now = _utc(observed_at or datetime.now(UTC))
+        if now >= _utc(snapshot.reset_at) or snapshot.remaining <= 0:
+            return False
+
+        if len(snapshot.local_usage_events) >= snapshot.remaining:
+            return False
+
+        key.provider_quota_snapshot = snapshot.model_copy(
+            update={"local_usage_events": [*snapshot.local_usage_events, now]}
+        ).model_dump_json()
+        return True
 
     def apply_quota_result(
         self,
@@ -145,8 +190,13 @@ class Context7ProviderAdapter(ProviderAdapter):
         result: ProviderQuotaSnapshot | ProviderQuotaError,
         *,
         expected_credential: str,
+        reconcile_local_usage: bool = False,
     ) -> bool:
-        """Apply a current-credential result without allowing stale quota rollback."""
+        """Apply a current-credential result without allowing stale quota rollback.
+
+        An explicit official refresh may reconcile a local overestimate; passive
+        responses stay monotonic so an older in-flight response cannot erase usage.
+        """
         if key.secret_key != expected_credential:
             return False
 
@@ -157,18 +207,33 @@ class Context7ProviderAdapter(ProviderAdapter):
                 previous_error.checked_at
             ):
                 return False
+            pending_events = (
+                [
+                    event
+                    for event in previous.local_usage_events
+                    if _utc(event) > _utc(result.checked_at)
+                ]
+                if previous is not None
+                else []
+            )
             if previous is not None:
                 previous_reset = _utc(previous.reset_at)
                 result_reset = _utc(result.reset_at)
+                if _utc(result.checked_at) < _utc(previous.checked_at):
+                    return False
                 if result_reset < previous_reset:
                     return False
                 if (
                     result_reset == previous_reset
                     and result.limit == previous.limit
-                    and result.remaining > previous.remaining
+                    and max(0, result.remaining - len(pending_events))
+                    > _effective_remaining(previous)
+                    and not (reconcile_local_usage and previous.local_usage_events)
                 ):
                     return False
-            key.provider_quota_snapshot = result.model_dump_json()
+            key.provider_quota_snapshot = result.model_copy(
+                update={"local_usage_events": pending_events}
+            ).model_dump_json()
             key.provider_quota_error = None
         else:
             previous_error = _load_error(key.provider_quota_error)
@@ -269,6 +334,10 @@ def _load_error(value: str | None) -> ProviderQuotaError | None:
         return ProviderQuotaError.model_validate_json(value)
     except ValueError:
         return None
+
+
+def _effective_remaining(snapshot: ProviderQuotaSnapshot) -> int:
+    return max(0, snapshot.remaining - len(snapshot.local_usage_events))
 
 
 def _utc(value: datetime) -> datetime:

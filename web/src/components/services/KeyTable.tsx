@@ -56,14 +56,16 @@ export const KeyTable: React.FC<KeyTableProps> = ({
   const [providerQuota, setProviderQuota] = useState<ServiceQuotaStatusResponse | null>(null);
   const [quotaLoading, setQuotaLoading] = useState(false);
   const [refreshingQuotaKey, setRefreshingQuotaKey] = useState<string | null>(null);
+  const [refreshingAllQuota, setRefreshingAllQuota] = useState(false);
   const [quotaRequestError, setQuotaRequestError] = useState(false);
   const activeServiceIdRef = useRef(service.id);
   activeServiceIdRef.current = service.id;
 
   const isContext7 = service.provider_type.toLowerCase() === 'context7';
   const gridTemplateColumns = isContext7
-    ? '1.1fr 1.1fr 0.8fr 1.7fr 0.7fr 1.3fr'
+    ? '1fr 1fr 0.75fr 1.55fr 1.2fr 0.65fr 1.25fr'
     : '1.2fr 1.2fr 0.8fr 1.5fr 0.8fr 1.2fr';
+  const tableMinWidth = isContext7 ? '980px' : '760px';
 
   const fetchProviderQuota = useCallback(
     async (showLoading = false, signal?: AbortSignal) => {
@@ -102,6 +104,7 @@ export const KeyTable: React.FC<KeyTableProps> = ({
   useEffect(() => {
     setProviderQuota(null);
     setRefreshingQuotaKey(null);
+    setRefreshingAllQuota(false);
     setQuotaRequestError(false);
     if (!isContext7) {
       setQuotaLoading(false);
@@ -137,6 +140,7 @@ export const KeyTable: React.FC<KeyTableProps> = ({
       const data = (await res.json()) as ServiceQuotaStatusResponse;
       if (activeServiceIdRef.current === data.service_id) {
         setProviderQuota(data);
+        fetchServices();
       }
     } catch (err) {
       console.error('Failed to refresh provider quota status', err);
@@ -146,6 +150,39 @@ export const KeyTable: React.FC<KeyTableProps> = ({
     } finally {
       if (activeServiceIdRef.current === requestServiceId) {
         setRefreshingQuotaKey(null);
+      }
+    }
+  };
+
+  const handleRefreshAllProviderQuota = async () => {
+    const warning = t.quotaRefreshAllWarning.replace(
+      '{count}',
+      String(service.keys.length)
+    );
+    if (!window.confirm(warning)) return;
+
+    const requestServiceId = service.id;
+    setRefreshingAllQuota(true);
+    setQuotaRequestError(false);
+    try {
+      const res = await fetch(`/api/admin/services/${service.id}/quota-status/refresh`, {
+        method: 'POST',
+        headers: authHeaders(),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = (await res.json()) as ServiceQuotaStatusResponse;
+      if (activeServiceIdRef.current === data.service_id) {
+        setProviderQuota(data);
+        fetchServices();
+      }
+    } catch (err) {
+      console.error('Failed to refresh all provider quota statuses', err);
+      if (activeServiceIdRef.current === requestServiceId) {
+        setQuotaRequestError(true);
+      }
+    } finally {
+      if (activeServiceIdRef.current === requestServiceId) {
+        setRefreshingAllQuota(false);
       }
     }
   };
@@ -180,6 +217,21 @@ export const KeyTable: React.FC<KeyTableProps> = ({
               <span style={{ color: quota.remaining === 0 ? '#b91c1c' : '#15803d' }}>
                 · {t.quotaRemaining} {quota.remaining}
               </span>
+              {quota.estimated && (
+                <span
+                  title={t.quotaEstimatedHint}
+                  style={{
+                    color: '#0369a1',
+                    border: '1px solid #7dd3fc',
+                    borderRadius: '3px',
+                    padding: '0 3px',
+                    fontSize: '9px',
+                    lineHeight: 1.4,
+                  }}
+                >
+                  {t.quotaEstimated}
+                </span>
+              )}
               {(quota.stale || hasLatestError) && (
                 <span
                   title={
@@ -259,7 +311,7 @@ export const KeyTable: React.FC<KeyTableProps> = ({
           <button
             type="button"
             onClick={() => void handleRefreshProviderQuota(keyId)}
-            disabled={refreshing}
+            disabled={refreshing || refreshingAllQuota}
             title={t.quotaRefreshWarning}
             style={{
               display: 'inline-flex',
@@ -272,10 +324,13 @@ export const KeyTable: React.FC<KeyTableProps> = ({
               color: '#4f46e5',
               fontSize: '10px',
               fontWeight: 600,
-              cursor: refreshing ? 'wait' : 'pointer',
+              cursor: refreshing || refreshingAllQuota ? 'wait' : 'pointer',
             }}
           >
-            <RefreshCw size={10} className={refreshing ? 'spin' : undefined} />
+            <RefreshCw
+              size={10}
+              className={refreshing || refreshingAllQuota ? 'spin' : undefined}
+            />
             {refreshing ? t.quotaRefreshing : t.quotaRefresh}
           </button>
         )}
@@ -401,19 +456,56 @@ export const KeyTable: React.FC<KeyTableProps> = ({
         >
           <Gauge size={14} style={{ flexShrink: 0, marginTop: '1px' }} />
           <span>{t.context7QuotaHint}</span>
-          {(quotaLoading || quotaRequestError) && (
-            <span style={{ marginLeft: 'auto', color: quotaRequestError ? '#b91c1c' : '#64748b' }}>
-              {quotaRequestError ? t.quotaQueryFailed : t.quotaLoading}
-            </span>
-          )}
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '8px',
+              marginLeft: 'auto',
+              flexShrink: 0,
+            }}
+          >
+            {(quotaLoading || quotaRequestError) && (
+              <span style={{ color: quotaRequestError ? '#b91c1c' : '#64748b' }}>
+                {quotaRequestError ? t.quotaQueryFailed : t.quotaLoading}
+              </span>
+            )}
+            {providerQuota?.can_refresh && (
+              <Button
+                variant="small"
+                onClick={() => void handleRefreshAllProviderQuota()}
+                disabled={
+                  refreshingAllQuota ||
+                  refreshingQuotaKey !== null ||
+                  service.keys.length === 0
+                }
+                title={t.quotaRefreshAllWarning.replace(
+                  '{count}',
+                  String(service.keys.length)
+                )}
+                style={{ color: '#4f46e5', borderColor: '#93c5fd' }}
+              >
+                <RefreshCw size={11} className={refreshingAllQuota ? 'spin' : undefined} />
+                {refreshingAllQuota ? t.quotaRefreshingAll : t.quotaRefreshAll}
+              </Button>
+            )}
+          </div>
         </div>
       )}
 
-      <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+      <div
+        style={{
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '6px',
+          overflowX: 'auto',
+        }}
+      >
         <div
           style={{
             display: 'grid',
             gridTemplateColumns,
+            minWidth: tableMinWidth,
             padding: '6px 10px',
             fontSize: '11px',
             fontWeight: 700,
@@ -425,7 +517,7 @@ export const KeyTable: React.FC<KeyTableProps> = ({
           <div>{t.thKeyMask}</div>
           <div>{t.thStatus}</div>
           {isContext7 && <div>{t.thProviderQuota}</div>}
-          {!isContext7 && <div>{t.thQuotaUsage}</div>}
+          <div>{t.thQuotaUsage}</div>
           <div>{t.thRequests}</div>
           <div>{t.thActions}</div>
         </div>
@@ -441,6 +533,7 @@ export const KeyTable: React.FC<KeyTableProps> = ({
               style={{
                 display: 'grid',
                 gridTemplateColumns,
+                minWidth: tableMinWidth,
                 padding: '8px 10px',
                 alignItems: 'center',
                 borderRadius: '6px',
@@ -487,48 +580,46 @@ export const KeyTable: React.FC<KeyTableProps> = ({
                   providerQuota?.keys.find((quota) => quota.key_id === k.id),
                   k.id
                 )}
-              {!isContext7 && (
-                <div>
-                  {k.monthly_quota > 0 ? (
-                    <div>
-                      <div
-                        style={{
-                          fontSize: '11px',
-                          color: pct >= 90 ? '#dc2626' : '#475569',
-                          fontWeight: 600,
-                          marginBottom: '2px',
-                        }}
-                      >
-                        {k.used_this_month} / {k.monthly_quota} ({pct}%)
-                      </div>
-                      <div
-                        style={{
-                          width: '100%',
-                          maxWidth: '120px',
-                          height: '4px',
-                          backgroundColor: '#e2e8f0',
-                          borderRadius: '2px',
-                          overflow: 'hidden',
-                        }}
-                      >
-                        <div
-                          style={{
-                            width: `${pct}%`,
-                            height: '100%',
-                            backgroundColor:
-                              pct >= 90 ? '#ef4444' : pct >= 75 ? '#f59e0b' : '#6366f1',
-                            borderRadius: '2px',
-                          }}
-                        />
-                      </div>
+              <div>
+                {k.monthly_quota > 0 ? (
+                  <div>
+                    <div
+                      style={{
+                        fontSize: '11px',
+                        color: pct >= 90 ? '#dc2626' : '#475569',
+                        fontWeight: 600,
+                        marginBottom: '2px',
+                      }}
+                    >
+                      {k.used_this_month} / {k.monthly_quota} ({pct}%)
                     </div>
-                  ) : (
-                    <span style={{ color: '#94a3b8', fontSize: '11px' }}>
-                      {k.used_this_month} / ∞
-                    </span>
-                  )}
-                </div>
-              )}
+                    <div
+                      style={{
+                        width: '100%',
+                        maxWidth: '120px',
+                        height: '4px',
+                        backgroundColor: '#e2e8f0',
+                        borderRadius: '2px',
+                        overflow: 'hidden',
+                      }}
+                    >
+                      <div
+                        style={{
+                          width: `${pct}%`,
+                          height: '100%',
+                          backgroundColor:
+                            pct >= 90 ? '#ef4444' : pct >= 75 ? '#f59e0b' : '#6366f1',
+                          borderRadius: '2px',
+                        }}
+                      />
+                    </div>
+                  </div>
+                ) : (
+                  <span style={{ color: '#94a3b8', fontSize: '11px' }}>
+                    {k.used_this_month} / ∞
+                  </span>
+                )}
+              </div>
               <div style={{ color: '#0f172a' }}>{k.requests_count}</div>
               <div style={{ display: 'flex', gap: '6px' }}>
                 <Button variant="small" onClick={() => openEditKey(k)}>

@@ -51,6 +51,7 @@ export interface ProviderQuotaKeyStatus {
   last_success_at: string | null;
   last_attempt_at: string | null;
   stale: boolean;
+  estimated: boolean;
   error_code: string | null;
 }
 

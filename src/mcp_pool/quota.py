@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import AsyncExitStack
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -129,17 +130,37 @@ async def refresh_provider_quota_status(
                     *(fetch(key, credential, client) for key, credential in targets)
                 )
 
-            updated_keys: list[AccountKey] = []
-            for key, credential, result in results:
-                if not any(current is key for current in manager.keys):
-                    continue
-                if adapter.apply_quota_result(
-                    key,
-                    result,
-                    expected_credential=credential,
-                ):
-                    updated_keys.append(key)
-            await registry.update_provider_quota_states_in_db(updated_keys)
+            async with AsyncExitStack() as quota_locks:
+                for locked_key_id in sorted(target_ids):
+                    await quota_locks.enter_async_context(
+                        registry.provider_quota_state_lock(locked_key_id)
+                    )
+                monthly_usage = await registry.get_monthly_usage()
+
+                updated_keys: list[AccountKey] = []
+                for key, credential, result in results:
+                    if not any(current is key for current in manager.keys):
+                        continue
+                    if adapter.apply_quota_result(
+                        key,
+                        result,
+                        expected_credential=credential,
+                        reconcile_local_usage=True,
+                    ):
+                        if isinstance(result, ProviderQuotaSnapshot):
+                            applied_snapshot = _load_snapshot(key.provider_quota_snapshot)
+                            if applied_snapshot is not None:
+                                effective_used = min(
+                                    applied_snapshot.limit,
+                                    applied_snapshot.used
+                                    + len(applied_snapshot.local_usage_events),
+                                )
+                                key.used_offset = effective_used - monthly_usage.get(
+                                    key.key_id,
+                                    0,
+                                )
+                        updated_keys.append(key)
+                await registry.update_provider_quota_states_in_db(updated_keys)
     finally:
         await registry.release_provider_quota_refresh(target_ids)
 
@@ -166,18 +187,24 @@ def _key_response(key: AccountKey, now: datetime) -> ProviderQuotaKeyResponse:
             error_code=error.error_code if error is not None else None,
         )
 
+    local_usage_delta = min(len(snapshot.local_usage_events), snapshot.remaining)
+    remaining = snapshot.remaining - local_usage_delta
+    used = min(snapshot.limit, snapshot.used + local_usage_delta)
+    status = "exhausted" if remaining == 0 else snapshot.status
+
     return ProviderQuotaKeyResponse(
         key_id=key.key_id,
-        status=error.status if error is not None else snapshot.status,
-        used=snapshot.used,
+        status=error.status if error is not None else status,
+        used=used,
         limit=snapshot.limit,
-        remaining=snapshot.remaining,
+        remaining=remaining,
         reset_at=_utc(snapshot.reset_at),
         last_success_at=_utc(snapshot.checked_at),
         last_attempt_at=(
             _utc(error.checked_at) if error is not None else _utc(snapshot.checked_at)
         ),
         stale=stale,
+        estimated=local_usage_delta > 0,
         error_code=error.error_code if error is not None else snapshot.error_code,
     )
 

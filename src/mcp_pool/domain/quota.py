@@ -15,7 +15,7 @@ ProviderQuotaServiceStatus = Literal[
 
 
 class ProviderQuotaSnapshot(BaseModel):
-    """Last authoritative quota values returned by an upstream provider."""
+    """Last authoritative provider values plus successful local usage since then."""
 
     status: Literal["ok", "exhausted"]
     used: int = Field(ge=0)
@@ -23,6 +23,7 @@ class ProviderQuotaSnapshot(BaseModel):
     remaining: int = Field(ge=0)
     reset_at: datetime
     checked_at: datetime
+    local_usage_events: list[datetime] = Field(default_factory=list)
     error_code: str | None = None
 
 
@@ -44,6 +45,7 @@ class ProviderQuotaKeyResponse(BaseModel):
     last_success_at: datetime | None = None
     last_attempt_at: datetime | None = None
     stale: bool
+    estimated: bool = False
     error_code: str | None = None
 
 

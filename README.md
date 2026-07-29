@@ -68,18 +68,28 @@ Explicit upstream rejections (`401`, `403`, or `429`) may fail over to another a
 failures such as connection loss or `5xx` responses are retried only for HTTP/MCP operations known
 to be read-only. `tools/call` is not replayed after an ambiguous failure.
 
-## Context7 official quota status
+## Context7 quota status
 
 For Context7 services, the account table can display the upstream request limit, used and
 remaining requests, reset time, snapshot age, and the latest safe error state for every key. These
 values are kept separate from MCPPool's locally configured `monthly_quota` and request-log count.
 
-Normal Context7 traffic through MCPPool updates the snapshot directly from the same upstream
-response, without an extra request. The dashboard then polls only MCPPool's persisted snapshot, so
-leaving the page open does not consume Context7 quota. Click **Query now** on a key when there has
-been no recent traffic. Context7 exposes API-key quota through the `RateLimit-Limit`,
-`RateLimit-Remaining`, and `RateLimit-Reset` response headers; the official HEAD query used to read
-those headers consumes one request itself, and the UI confirms that cost before sending it.
+When a successful Context7 `tools/call` response includes complete `RateLimit-Limit`,
+`RateLimit-Remaining`, and `RateLimit-Reset` headers, MCPPool stores those official values. When
+Context7 omits the headers, MCPPool advances an existing, unexpired official snapshot by one and
+marks the displayed value as a local estimate. Handshake, notification, discovery, and session
+close requests are not added. The dashboard polls only MCPPool's persisted state, so leaving the
+page open does not consume Context7 quota.
+
+Click **Query now** to establish or calibrate the official baseline, including usage made outside
+MCPPool. The fixed official HEAD query consumes one Context7 request itself, and the UI confirms
+that cost before sending it. A successful query also recalculates the local manual offset so the
+separate **Local Usage / Manual Quota** column matches the effective official used value at that
+moment. A failed query leaves the previous offset unchanged.
+
+A local estimate cannot be shown before the first successful official query. After the saved reset
+time, the old value remains visible as stale but receives no further local increments until another
+official query establishes the new period.
 
 Administration endpoints:
 

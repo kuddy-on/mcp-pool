@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from mcp_pool import db
 from mcp_pool.app import create_app, lifespan
 from mcp_pool.db import AccountKeyModel, async_session
+from mcp_pool.domain.admin import RequestLogItem
 from mcp_pool.domain.quota import ProviderQuotaError, ProviderQuotaSnapshot
 from mcp_pool.domain.service import ServiceConfig
 from mcp_pool.pool import AccountKey, KeyPoolManager, KeyPoolRegistry
@@ -20,7 +21,7 @@ from mcp_pool.providers.context7 import (
     parse_context7_quota_response,
 )
 from mcp_pool.providers.generic import GenericHeaderProviderAdapter
-from mcp_pool.quota import get_provider_quota_status
+from mcp_pool.quota import get_provider_quota_status, refresh_provider_quota_status
 
 
 def test_parse_context7_quota_success() -> None:
@@ -296,6 +297,303 @@ def test_passive_capture_updates_only_actionable_context7_responses() -> None:
     assert key.provider_quota_error == saved_error
 
 
+def test_success_without_headers_adds_one_to_an_existing_official_snapshot() -> None:
+    checked_at = datetime.now(UTC)
+    key = AccountKey(
+        key_id="estimated-key",
+        name="Estimated",
+        secret_key="ctx7-test",
+        provider_quota_snapshot=ProviderQuotaSnapshot(
+            status="ok",
+            used=10,
+            limit=100,
+            remaining=90,
+            reset_at=checked_at + timedelta(days=1),
+            checked_at=checked_at,
+        ).model_dump_json(),
+    )
+    adapter = Context7ProviderAdapter()
+
+    updated = adapter.capture_quota_response(
+        key,
+        httpx.Response(200),
+        expected_credential="ctx7-test",
+        estimate_success_without_headers=True,
+    )
+
+    assert updated is True
+    assert key.provider_quota_snapshot is not None
+    snapshot = ProviderQuotaSnapshot.model_validate_json(key.provider_quota_snapshot)
+    assert snapshot.used == 10
+    assert snapshot.remaining == 90
+    assert len(snapshot.local_usage_events) == 1
+    assert snapshot.local_usage_events[0] >= checked_at
+    assert snapshot.checked_at == checked_at
+
+    manager = KeyPoolManager(
+        "estimated-service",
+        ServiceConfig(
+            name="estimated-service",
+            upstream_url="https://mcp.context7.com/mcp",
+            provider_type="context7",
+        ),
+    )
+    manager.keys = [key]
+    response = get_provider_quota_status(manager, now=checked_at + timedelta(minutes=1))
+    assert response.keys[0].used == 11
+    assert response.keys[0].remaining == 89
+    assert response.keys[0].estimated is True
+    assert response.keys[0].last_success_at == checked_at
+
+
+def test_local_quota_increment_requires_a_current_snapshot_and_current_credential() -> None:
+    now = datetime(2026, 7, 28, 12, 0, tzinfo=UTC)
+    adapter = Context7ProviderAdapter()
+    missing = AccountKey(
+        key_id="missing-snapshot",
+        name="Missing",
+        secret_key="ctx7-test",
+    )
+    expired = AccountKey(
+        key_id="expired-snapshot",
+        name="Expired",
+        secret_key="ctx7-test",
+        provider_quota_snapshot=ProviderQuotaSnapshot(
+            status="ok",
+            used=20,
+            limit=100,
+            remaining=80,
+            reset_at=now,
+            checked_at=now - timedelta(hours=1),
+        ).model_dump_json(),
+    )
+
+    assert (
+        adapter.increment_quota_usage(
+            missing,
+            expected_credential="ctx7-test",
+            observed_at=now,
+        )
+        is False
+    )
+    assert (
+        adapter.increment_quota_usage(
+            expired,
+            expected_credential="ctx7-test",
+            observed_at=now,
+        )
+        is False
+    )
+    assert (
+        adapter.increment_quota_usage(
+            expired,
+            expected_credential="old-credential",
+            observed_at=now - timedelta(seconds=1),
+        )
+        is False
+    )
+    assert expired.provider_quota_snapshot is not None
+    snapshot = ProviderQuotaSnapshot.model_validate_json(expired.provider_quota_snapshot)
+    assert snapshot.local_usage_events == []
+
+
+def test_official_quota_result_absorbs_local_usage_without_double_counting() -> None:
+    now = datetime(2026, 7, 28, 12, 0, tzinfo=UTC)
+    key = AccountKey(
+        key_id="calibrated-key",
+        name="Calibrated",
+        secret_key="ctx7-test",
+        provider_quota_snapshot=ProviderQuotaSnapshot(
+            status="ok",
+            used=10,
+            limit=100,
+            remaining=90,
+            reset_at=now + timedelta(days=1),
+            checked_at=now,
+            local_usage_events=[now + timedelta(seconds=30)],
+        ).model_dump_json(),
+    )
+    official = ProviderQuotaSnapshot(
+        status="ok",
+        used=12,
+        limit=100,
+        remaining=88,
+        reset_at=now + timedelta(days=1),
+        checked_at=now + timedelta(minutes=1),
+    )
+
+    applied = Context7ProviderAdapter().apply_quota_result(
+        key,
+        official,
+        expected_credential="ctx7-test",
+    )
+
+    assert applied is True
+    assert key.provider_quota_snapshot is not None
+    calibrated = ProviderQuotaSnapshot.model_validate_json(key.provider_quota_snapshot)
+    assert calibrated.used == 12
+    assert calibrated.remaining == 88
+    assert calibrated.local_usage_events == []
+
+
+def test_older_header_response_preserves_usage_observed_after_it() -> None:
+    baseline_at = datetime(2026, 7, 28, 12, 0, tzinfo=UTC)
+    official_response_at = baseline_at + timedelta(minutes=1)
+    later_business_at = baseline_at + timedelta(minutes=2)
+    latest_business_at = baseline_at + timedelta(minutes=3)
+    reset_at = baseline_at + timedelta(days=1)
+    key = AccountKey(
+        key_id="out-of-order-key",
+        name="Out of order",
+        secret_key="ctx7-test",
+        provider_quota_snapshot=ProviderQuotaSnapshot(
+            status="ok",
+            used=10,
+            limit=100,
+            remaining=90,
+            reset_at=reset_at,
+            checked_at=baseline_at,
+            local_usage_events=[later_business_at, latest_business_at],
+        ).model_dump_json(),
+    )
+
+    applied = Context7ProviderAdapter().capture_quota_response(
+        key,
+        httpx.Response(
+            200,
+            headers={
+                "RateLimit-Limit": "100",
+                "RateLimit-Remaining": "89",
+                "RateLimit-Reset": str(int(reset_at.timestamp())),
+            },
+        ),
+        expected_credential="ctx7-test",
+        observed_at=official_response_at,
+    )
+
+    assert applied is True
+    assert key.provider_quota_snapshot is not None
+    snapshot = ProviderQuotaSnapshot.model_validate_json(key.provider_quota_snapshot)
+    assert snapshot.used == 11
+    assert snapshot.remaining == 89
+    assert snapshot.local_usage_events == [later_business_at, latest_business_at]
+
+    manager = KeyPoolManager(
+        "out-of-order-service",
+        ServiceConfig(
+            name="out-of-order-service",
+            upstream_url="https://mcp.context7.com/mcp",
+            provider_type="context7",
+        ),
+    )
+    manager.keys = [key]
+    response = get_provider_quota_status(manager, now=latest_business_at)
+    assert response.keys[0].used == 13
+    assert response.keys[0].remaining == 87
+
+
+def test_explicit_official_calibration_can_correct_a_local_overestimate() -> None:
+    now = datetime(2026, 7, 28, 12, 0, tzinfo=UTC)
+    key = AccountKey(
+        key_id="corrected-key",
+        name="Corrected",
+        secret_key="ctx7-test",
+        provider_quota_snapshot=ProviderQuotaSnapshot(
+            status="ok",
+            used=10,
+            limit=100,
+            remaining=90,
+            reset_at=now + timedelta(days=1),
+            checked_at=now,
+            local_usage_events=[
+                now + timedelta(seconds=10),
+                now + timedelta(seconds=20),
+            ],
+        ).model_dump_json(),
+    )
+    official = ProviderQuotaSnapshot(
+        status="ok",
+        used=11,
+        limit=100,
+        remaining=89,
+        reset_at=now + timedelta(days=1),
+        checked_at=now + timedelta(minutes=1),
+    )
+    adapter = Context7ProviderAdapter()
+
+    assert (
+        adapter.apply_quota_result(
+            key,
+            official,
+            expected_credential="ctx7-test",
+        )
+        is False
+    )
+    assert (
+        adapter.apply_quota_result(
+            key,
+            official,
+            expected_credential="ctx7-test",
+            reconcile_local_usage=True,
+        )
+        is True
+    )
+    assert key.provider_quota_snapshot is not None
+    corrected = ProviderQuotaSnapshot.model_validate_json(key.provider_quota_snapshot)
+    assert corrected.used == 11
+    assert corrected.remaining == 89
+    assert corrected.local_usage_events == []
+
+
+def test_local_quota_increment_stops_at_zero_remaining() -> None:
+    now = datetime(2026, 7, 28, 12, 0, tzinfo=UTC)
+    key = AccountKey(
+        key_id="last-request-key",
+        name="Last request",
+        secret_key="ctx7-test",
+        provider_quota_snapshot=ProviderQuotaSnapshot(
+            status="ok",
+            used=99,
+            limit=100,
+            remaining=1,
+            reset_at=now + timedelta(days=1),
+            checked_at=now,
+        ).model_dump_json(),
+    )
+    adapter = Context7ProviderAdapter()
+
+    assert (
+        adapter.increment_quota_usage(
+            key,
+            expected_credential="ctx7-test",
+            observed_at=now + timedelta(minutes=1),
+        )
+        is True
+    )
+    assert (
+        adapter.increment_quota_usage(
+            key,
+            expected_credential="ctx7-test",
+            observed_at=now + timedelta(minutes=2),
+        )
+        is False
+    )
+
+    manager = KeyPoolManager(
+        "last-request-service",
+        ServiceConfig(
+            name="last-request-service",
+            upstream_url="https://mcp.context7.com/mcp",
+            provider_type="context7",
+        ),
+    )
+    manager.keys = [key]
+    response = get_provider_quota_status(manager, now=now + timedelta(minutes=2))
+    assert response.keys[0].status == "exhausted"
+    assert response.keys[0].used == 100
+    assert response.keys[0].remaining == 0
+
+
 @pytest.mark.asyncio
 async def test_context7_quota_fetch_uses_fixed_head_endpoint_and_bearer_auth() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
@@ -381,6 +679,309 @@ async def test_proxy_passively_persists_context7_quota_from_the_same_request() -
             stored_key = stored.scalar_one()
             assert stored_key.provider_quota_snapshot == account_key.provider_quota_snapshot
             assert stored_key.provider_quota_error is None
+
+
+@pytest.mark.asyncio
+async def test_proxy_estimates_success_without_headers_and_ignores_probe_requests() -> None:
+    app = create_app()
+    service_name = f"estimated-proxy-{uuid4().hex[:8]}"
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"jsonrpc": "2.0", "result": "ok", "id": 1},
+        )
+
+    async with lifespan(app):
+        import mcp_pool.app as app_module
+
+        assert app_module.http_client is not None
+        await app_module.http_client.aclose()
+        app_module.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        assert app_module.pool_registry is not None
+        manager = await app_module.pool_registry.add_service(
+            ServiceConfig(
+                name=service_name,
+                upstream_url="https://mcp.context7.com/mcp",
+                provider_type="context7",
+                api_keys=["ctx7-estimated-key"],
+            )
+        )
+        account_key = manager.keys[0]
+        checked_at = datetime.now(UTC)
+        account_key.provider_quota_snapshot = ProviderQuotaSnapshot(
+            status="ok",
+            used=20,
+            limit=100,
+            remaining=80,
+            reset_at=checked_at + timedelta(days=1),
+            checked_at=checked_at,
+        ).model_dump_json()
+        await app_module.pool_registry.update_provider_quota_states_in_db([account_key])
+        _, gateway_key = await app_module.pool_registry.create_client_api_key(
+            f"estimated-proxy-{uuid4().hex[:8]}"
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            probe = await client.post(
+                f"/s/{service_name}/mcp",
+                headers={"Authorization": f"Bearer {gateway_key}"},
+                json={"jsonrpc": "2.0", "method": "ping", "id": 1},
+            )
+            notification = await client.post(
+                f"/s/{service_name}/mcp",
+                headers={"Authorization": f"Bearer {gateway_key}"},
+                json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+            )
+            session_close = await client.request(
+                "DELETE",
+                f"/s/{service_name}/mcp",
+                headers={"Authorization": f"Bearer {gateway_key}"},
+            )
+            business = await client.post(
+                f"/s/{service_name}/mcp",
+                headers={"Authorization": f"Bearer {gateway_key}"},
+                json={
+                    "jsonrpc": "2.0",
+                    "method": "tools/call",
+                    "params": {"name": "query-docs", "arguments": {}},
+                    "id": 2,
+                },
+            )
+
+        assert probe.status_code == 200
+        assert notification.status_code == 200
+        assert session_close.status_code == 200
+        assert business.status_code == 200
+        assert account_key.provider_quota_snapshot is not None
+        snapshot = ProviderQuotaSnapshot.model_validate_json(account_key.provider_quota_snapshot)
+        assert len(snapshot.local_usage_events) == 1
+        monthly_usage = await app_module.pool_registry.get_monthly_usage()
+        assert monthly_usage[account_key.key_id] == 1
+        quota = get_provider_quota_status(manager)
+        assert quota.keys[0].used == 21
+        assert quota.keys[0].remaining == 79
+        assert quota.keys[0].estimated is True
+
+        async with async_session() as session:
+            stored = await session.execute(
+                select(AccountKeyModel).where(AccountKeyModel.id == account_key.key_id)
+            )
+            stored_key = stored.scalar_one()
+            assert stored_key.provider_quota_snapshot is not None
+            stored_snapshot = ProviderQuotaSnapshot.model_validate_json(
+                stored_key.provider_quota_snapshot
+            )
+            assert len(stored_snapshot.local_usage_events) == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_proxy_successes_persist_every_local_quota_increment() -> None:
+    app = create_app()
+    service_name = f"concurrent-estimate-{uuid4().hex[:8]}"
+    request_count = 8
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"jsonrpc": "2.0", "result": "ok", "id": 1},
+        )
+
+    async with lifespan(app):
+        import mcp_pool.app as app_module
+
+        assert app_module.http_client is not None
+        await app_module.http_client.aclose()
+        app_module.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        assert app_module.pool_registry is not None
+        manager = await app_module.pool_registry.add_service(
+            ServiceConfig(
+                name=service_name,
+                upstream_url="https://mcp.context7.com/mcp",
+                provider_type="context7",
+                api_keys=["ctx7-concurrent-key"],
+            )
+        )
+        account_key = manager.keys[0]
+        checked_at = datetime.now(UTC)
+        account_key.provider_quota_snapshot = ProviderQuotaSnapshot(
+            status="ok",
+            used=100,
+            limit=1000,
+            remaining=900,
+            reset_at=checked_at + timedelta(days=1),
+            checked_at=checked_at,
+        ).model_dump_json()
+        await app_module.pool_registry.update_provider_quota_states_in_db([account_key])
+        _, gateway_key = await app_module.pool_registry.create_client_api_key(
+            f"concurrent-estimate-{uuid4().hex[:8]}"
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            responses = await asyncio.gather(
+                *(
+                    client.post(
+                        f"/s/{service_name}/mcp",
+                        headers={"Authorization": f"Bearer {gateway_key}"},
+                        json={
+                            "jsonrpc": "2.0",
+                            "method": "tools/call",
+                            "params": {"name": "query-docs", "arguments": {"i": index}},
+                            "id": index,
+                        },
+                    )
+                    for index in range(request_count)
+                )
+            )
+
+        assert all(response.status_code == 200 for response in responses)
+        assert account_key.provider_quota_snapshot is not None
+        snapshot = ProviderQuotaSnapshot.model_validate_json(account_key.provider_quota_snapshot)
+        assert len(snapshot.local_usage_events) == request_count
+        quota = get_provider_quota_status(manager)
+        assert quota.keys[0].used == 100 + request_count
+        assert quota.keys[0].remaining == 900 - request_count
+
+        async with async_session() as session:
+            stored = await session.execute(
+                select(AccountKeyModel).where(AccountKeyModel.id == account_key.key_id)
+            )
+            stored_key = stored.scalar_one()
+            assert stored_key.provider_quota_snapshot is not None
+            stored_snapshot = ProviderQuotaSnapshot.model_validate_json(
+                stored_key.provider_quota_snapshot
+            )
+            assert len(stored_snapshot.local_usage_events) == request_count
+
+
+@pytest.mark.asyncio
+async def test_business_success_after_official_observation_survives_refresh_apply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = create_app()
+    service_name = f"refresh-race-{uuid4().hex[:8]}"
+    official_response_ready = asyncio.Event()
+    allow_refresh_to_apply = asyncio.Event()
+    official_checked_at: datetime | None = None
+    reset_at = datetime.now(UTC) + timedelta(days=1)
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"jsonrpc": "2.0", "result": "ok", "id": 1},
+        )
+
+    async def delayed_official_fetch(
+        _adapter: Context7ProviderAdapter,
+        _credential: str,
+        _client: httpx.AsyncClient,
+    ) -> ProviderQuotaSnapshot:
+        nonlocal official_checked_at
+        official_checked_at = datetime.now(UTC)
+        official_response_ready.set()
+        await allow_refresh_to_apply.wait()
+        return ProviderQuotaSnapshot(
+            status="ok",
+            used=11,
+            limit=100,
+            remaining=89,
+            reset_at=reset_at,
+            checked_at=official_checked_at,
+        )
+
+    monkeypatch.setattr(
+        Context7ProviderAdapter,
+        "fetch_quota_status",
+        delayed_official_fetch,
+    )
+
+    async with lifespan(app):
+        import mcp_pool.app as app_module
+
+        assert app_module.http_client is not None
+        await app_module.http_client.aclose()
+        app_module.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        assert app_module.pool_registry is not None
+        registry = app_module.pool_registry
+        manager = await registry.add_service(
+            ServiceConfig(
+                name=service_name,
+                upstream_url="https://mcp.context7.com/mcp",
+                provider_type="context7",
+                api_keys=["ctx7-refresh-race-key"],
+            )
+        )
+        account_key = manager.keys[0]
+        baseline_checked_at = datetime.now(UTC) - timedelta(minutes=1)
+        account_key.provider_quota_snapshot = ProviderQuotaSnapshot(
+            status="ok",
+            used=10,
+            limit=100,
+            remaining=90,
+            reset_at=reset_at,
+            checked_at=baseline_checked_at,
+        ).model_dump_json()
+        await registry.update_provider_quota_states_in_db([account_key])
+        _, gateway_key = await registry.create_client_api_key(f"refresh-race-{uuid4().hex[:8]}")
+
+        refresh_task = asyncio.create_task(
+            refresh_provider_quota_status(
+                manager,
+                registry,
+                key_id=account_key.key_id,
+            )
+        )
+        await asyncio.wait_for(official_response_ready.wait(), timeout=1)
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            business = await client.post(
+                f"/s/{service_name}/mcp",
+                headers={"Authorization": f"Bearer {gateway_key}"},
+                json={
+                    "jsonrpc": "2.0",
+                    "method": "tools/call",
+                    "params": {"name": "query-docs", "arguments": {}},
+                    "id": 1,
+                },
+            )
+        assert business.status_code == 200
+
+        allow_refresh_to_apply.set()
+        refreshed = await asyncio.wait_for(refresh_task, timeout=1)
+        refreshed_key = refreshed.keys[0]
+        assert refreshed_key.used == 12
+        assert refreshed_key.remaining == 88
+        assert refreshed_key.estimated is True
+        monthly_usage = await registry.get_monthly_usage()
+        assert monthly_usage[account_key.key_id] == 1
+        assert account_key.used_offset == 11
+        assert account_key.to_response(monthly_usage).used_this_month == 12
+
+        assert account_key.provider_quota_snapshot is not None
+        snapshot = ProviderQuotaSnapshot.model_validate_json(account_key.provider_quota_snapshot)
+        assert len(snapshot.local_usage_events) == 1
+        assert official_checked_at is not None
+        assert snapshot.local_usage_events[0] > official_checked_at
+
+        async with async_session() as session:
+            stored = await session.execute(
+                select(AccountKeyModel).where(AccountKeyModel.id == account_key.key_id)
+            )
+            stored_key = stored.scalar_one()
+            assert stored_key.provider_quota_snapshot is not None
+            stored_snapshot = ProviderQuotaSnapshot.model_validate_json(
+                stored_key.provider_quota_snapshot
+            )
+            assert len(stored_snapshot.local_usage_events) == 1
 
 
 async def _login_admin(client: httpx.AsyncClient) -> dict[str, str]:
@@ -809,6 +1410,22 @@ async def test_quota_refresh_selected_key_partial_failure_and_persistence(
         keys = created.json()["keys"]
         good_key_id = str(keys[0]["id"])
         bad_key_id = str(keys[1]["id"])
+        registry = db_value_registry()
+        await registry.add_log(
+            RequestLogItem(
+                id=str(uuid4()),
+                service_name=service_name,
+                timestamp=datetime.now(UTC),
+                method="POST",
+                path="mcp",
+                mcp_method="tools/call (query-docs)",
+                key_id=good_key_id,
+                key_name=str(keys[0]["name"]),
+                status_code=200,
+                signal_kind="success",
+                duration_ms=1.0,
+            )
+        )
 
         selected = await client.post(
             f"/api/admin/services/{service_id}/quota-status/refresh",
@@ -828,6 +1445,13 @@ async def test_quota_refresh_selected_key_partial_failure_and_persistence(
             == selected_keys[good_key_id]["last_success_at"]
         )
         assert selected_keys[bad_key_id]["status"] == "unknown"
+        manager = registry.get_manager(service_id)
+        assert manager is not None
+        good_key = next(key for key in manager.keys if key.key_id == good_key_id)
+        monthly_usage = await registry.get_monthly_usage()
+        assert monthly_usage[good_key_id] == 1
+        assert good_key.used_offset == 10
+        assert good_key.to_response(monthly_usage).used_this_month == 11
 
         missing_key = await client.post(
             f"/api/admin/services/{service_id}/quota-status/refresh",
@@ -849,8 +1473,6 @@ async def test_quota_refresh_selected_key_partial_failure_and_persistence(
         assert all_key_data[bad_key_id]["status"] == "auth_invalid"
         assert all_key_data[bad_key_id]["error_code"] == "auth_invalid"
 
-        manager = db_value_registry().get_manager(service_id)
-        assert manager is not None
         bad_key = next(key for key in manager.keys if key.key_id == bad_key_id)
         assert bad_key.is_active is True
         assert bad_key.quota_exhausted is False
@@ -878,6 +1500,7 @@ async def test_quota_refresh_selected_key_partial_failure_and_persistence(
             stored_key = stored.scalar_one()
             assert stored_key.provider_quota_snapshot is not None
             assert stored_key.provider_quota_error is not None
+            assert stored_key.used_offset == 10
 
         reloaded_registry = KeyPoolRegistry([])
         await reloaded_registry.initialize()
@@ -888,6 +1511,8 @@ async def test_quota_refresh_selected_key_partial_failure_and_persistence(
         assert reloaded_good.status == "error"
         assert reloaded_good.used == 11
         assert reloaded_good.error_code == "network_error"
+        reloaded_key = next(key for key in reloaded_manager.keys if key.key_id == good_key_id)
+        assert reloaded_key.used_offset == 10
 
 
 @pytest.mark.asyncio
