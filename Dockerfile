@@ -7,13 +7,21 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-COPY pyproject.toml README.md ./
-RUN uv sync --no-dev --no-install-project
+COPY pyproject.toml uv.lock README.md ./
+COPY src/mcp_pool/__init__.py ./src/mcp_pool/__init__.py
+RUN uv sync --frozen --no-dev --no-install-project
 
 COPY src ./src
-RUN uv sync --no-dev
+RUN uv sync --frozen --no-dev
 
 ENV PATH="/app/.venv/bin:$PATH"
+
+RUN groupadd --system mcp-pool \
+    && useradd --system --gid mcp-pool --home-dir /app mcp-pool \
+    && mkdir -p /app/data \
+    && chown -R mcp-pool:mcp-pool /app/data
+
+USER mcp-pool
 
 EXPOSE 8000
 

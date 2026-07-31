@@ -8,8 +8,12 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  quality:
+  backend:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,6 +25,8 @@ jobs:
           python-version-file: .python-version
       - name: Install dependencies
         run: uv sync --all-groups
+      - name: Lockfile
+        run: uv lock --check
       - name: Ruff
         run: |
           uv run ruff check .
@@ -28,4 +34,66 @@ jobs:
       - name: Mypy
         run: uv run mypy src tests
       - name: Tests
-        run: uv run pytest
+        run: uv run pytest --cov=mcp_pool --cov-report=term-missing --cov-fail-under=85
+      - name: Dependency audit
+        run: |
+          uv export --frozen --no-dev --no-emit-project --format requirements-txt \
+            --quiet --output-file /tmp/mcp-pool-requirements.txt
+          uvx --python 3.12 pip-audit -r /tmp/mcp-pool-requirements.txt
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm audit --audit-level=high --registry=https://registry.npmjs.org
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+      - run: npx playwright install --with-deps chromium
+      - run: npm run e2e
+
+  containers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: mcp-pool:test
+          cache-from: type=gha,scope=gateway
+          cache-to: type=gha,mode=max,scope=gateway
+      - uses: docker/build-push-action@v6
+        with:
+          context: web
+          push: false
+          load: true
+          tags: mcp-pool-web:test
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,mode=max,scope=web
+      - name: Gateway smoke test
+        run: |
+          docker run --rm -d --name mcp-pool-smoke \
+            -e MCP_POOL_ENVIRONMENT=test \
+            -e MCP_POOL_SECRET_KEY=ci-only-secret \
+            -p 127.0.0.1:18000:8000 mcp-pool:test
+          trap 'docker stop mcp-pool-smoke' EXIT
+          for attempt in {1..20}; do
+            if curl --fail --silent http://127.0.0.1:18000/health/ready; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs mcp-pool-smoke
+          exit 1
