@@ -1,8 +1,11 @@
 from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import select
 
+from mcp_pool.auth import hash_password, verify_password
+from mcp_pool.config import Settings
 from mcp_pool.crypto import HASHED_KEY_PREFIX
 from mcp_pool.db import (
     AccountKeyModel,
@@ -10,6 +13,7 @@ from mcp_pool.db import (
     ServiceModel,
     async_session,
 )
+from mcp_pool.domain.service import ServiceConfig, is_private_upstream
 from mcp_pool.pool import KeyPoolRegistry
 
 
@@ -65,3 +69,41 @@ async def test_registry_migrates_legacy_plaintext_secrets() -> None:
     assert stored_client.api_key.startswith(HASHED_KEY_PREFIX)
     assert stored_client.api_key != gateway_secret
     assert registry.validate_client_key(f"Bearer {gateway_secret}") == "Legacy client"
+
+
+def test_password_hashes_are_salted_and_memory_hard() -> None:
+    first = hash_password("correct horse battery staple")
+    second = hash_password("correct horse battery staple")
+
+    assert first.startswith("scrypt$")
+    assert first != second
+    assert verify_password("correct horse battery staple", first)
+    assert not verify_password("wrong password", first)
+
+
+def test_production_rejects_default_or_short_application_secrets() -> None:
+    with pytest.raises(ValidationError):
+        Settings(environment="production", secret_key="development-only-secret")
+    with pytest.raises(ValidationError):
+        Settings(environment="production", secret_key="too-short")
+
+    settings = Settings(environment="production", secret_key="x" * 32)
+    assert settings.environment == "production"
+
+
+def test_gateway_is_closed_when_no_client_keys_exist() -> None:
+    registry = KeyPoolRegistry([])
+
+    assert registry.validate_client_key(None) is None
+    assert registry.validate_client_key("Bearer unknown") is None
+
+
+def test_upstream_urls_reject_unsafe_syntax_and_private_literals() -> None:
+    with pytest.raises(ValidationError):
+        ServiceConfig(name="bad", upstream_url="file:///etc/passwd")
+    with pytest.raises(ValidationError):
+        ServiceConfig(name="bad", upstream_url="https://user:pass@example.com/mcp")
+
+    assert is_private_upstream("http://127.0.0.1:8000/mcp")
+    assert is_private_upstream("http://[::1]/mcp")
+    assert not is_private_upstream("https://api.example.com/mcp")

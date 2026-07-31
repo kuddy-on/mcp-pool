@@ -1,6 +1,6 @@
 # ADR 0002: One API key per routed account
 
-- Status: Superseded for the SQLite deployment
+- Status: Accepted
 - Date: 2026-07-27
 
 ## Context

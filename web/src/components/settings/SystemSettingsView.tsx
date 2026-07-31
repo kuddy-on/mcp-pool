@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { Settings, Plus, Key, Copy, CheckCircle, Trash2 } from 'lucide-react';
+import { apiRequest } from '../../api/client';
 import type { ClientApiKey, UserDTO } from '../../types';
 import { Button } from '../common/Button';
 import { Modal } from '../common/Modal';
@@ -11,7 +12,7 @@ export interface SystemSettingsViewProps {
   clientKeys: ClientApiKey[];
   currentUser: UserDTO | null;
   t: Record<string, string>;
-  authHeaders: () => HeadersInit;
+  token: string;
   fetchSettings: () => void;
 }
 
@@ -21,7 +22,7 @@ export const SystemSettingsView: React.FC<SystemSettingsViewProps> = ({
   clientKeys,
   currentUser,
   t,
-  authHeaders,
+  token,
   fetchSettings,
 }) => {
   const [showAddClientKeyModal, setShowAddClientKeyModal] = useState(false);
@@ -31,9 +32,8 @@ export const SystemSettingsView: React.FC<SystemSettingsViewProps> = ({
 
   const handleSaveSettings = async () => {
     try {
-      await fetch('/api/admin/settings', {
+      await apiRequest('/api/admin/settings', token, {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({ gateway_external_url: externalUrl }),
       });
       fetchSettings();
@@ -45,18 +45,14 @@ export const SystemSettingsView: React.FC<SystemSettingsViewProps> = ({
   const handleCreateClientKey = async () => {
     if (!newClientKeyName) return;
     try {
-      const res = await fetch('/api/admin/client-keys', {
+      const data = await apiRequest<{ api_key: string }>('/api/admin/client-keys', token, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({ name: newClientKeyName }),
       });
-      if (res.ok) {
-        const data = await res.json();
-        setNewlyCreatedKey(data.api_key);
-        setShowAddClientKeyModal(false);
-        setNewClientKeyName('');
-        fetchSettings();
-      }
+      setNewlyCreatedKey(data.api_key);
+      setShowAddClientKeyModal(false);
+      setNewClientKeyName('');
+      fetchSettings();
     } catch (err) {
       console.error('Failed to create client key', err);
     }
@@ -64,9 +60,8 @@ export const SystemSettingsView: React.FC<SystemSettingsViewProps> = ({
 
   const handleDeleteClientKey = async (keyId: string) => {
     try {
-      await fetch(`/api/admin/client-keys/${keyId}`, {
+      await apiRequest(`/api/admin/client-keys/${keyId}`, token, {
         method: 'DELETE',
-        headers: authHeaders(),
       });
       fetchSettings();
     } catch (err) {

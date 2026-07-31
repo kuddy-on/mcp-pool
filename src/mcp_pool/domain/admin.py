@@ -1,22 +1,24 @@
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from mcp_pool.domain.service import normalize_upstream_url
 
 
 class KeyCreateRequest(BaseModel):
-    name: str
-    secret_key: str
-    weight: float = 1.0
-    monthly_quota: int = 0  # 0 = unlimited
+    name: str = Field(min_length=1, max_length=64)
+    secret_key: str = Field(min_length=1, max_length=8192)
+    weight: float = Field(default=1.0, gt=0, le=100)
+    monthly_quota: int = Field(default=0, ge=0)  # 0 = unlimited
 
 
 class KeyUpdateRequest(BaseModel):
-    name: str | None = None
-    secret_key: str | None = None
-    weight: float | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=64)
+    secret_key: str | None = Field(default=None, min_length=1, max_length=8192)
+    weight: float | None = Field(default=None, gt=0, le=100)
     is_active: bool | None = None
-    monthly_quota: int | None = None
-    used_this_month: int | None = None
+    monthly_quota: int | None = Field(default=None, ge=0)
+    used_this_month: int | None = Field(default=None, ge=0)
 
 
 class KeyResponse(BaseModel):
@@ -35,19 +37,23 @@ class KeyResponse(BaseModel):
 
 
 class ServiceCreateRequest(BaseModel):
-    name: str
-    upstream_url: str
+    name: str = Field(min_length=1, max_length=64)
+    upstream_url: str = Field(min_length=8, max_length=2048)
     provider_type: str = "generic"
     auth_header: str = "Authorization"
     auth_prefix: str = "Bearer "
     api_keys: list[str] = Field(default_factory=list)
 
+    _normalize_url = field_validator("upstream_url")(normalize_upstream_url)
+
 
 class ServiceUpdateRequest(BaseModel):
-    upstream_url: str | None = None
+    upstream_url: str | None = Field(default=None, min_length=8, max_length=2048)
     provider_type: str | None = None
     auth_header: str | None = None
     auth_prefix: str | None = None
+
+    _normalize_url = field_validator("upstream_url")(normalize_upstream_url)
 
 
 class ServiceResponse(BaseModel):
@@ -96,7 +102,7 @@ class ClientApiKeyResponse(BaseModel):
 
 
 class ClientApiKeyCreateRequest(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=64)
 
 
 class SystemSettingsResponse(BaseModel):
@@ -104,4 +110,6 @@ class SystemSettingsResponse(BaseModel):
 
 
 class SystemSettingsUpdateRequest(BaseModel):
-    gateway_external_url: str
+    gateway_external_url: str = Field(min_length=8, max_length=2048)
+
+    _normalize_url = field_validator("gateway_external_url")(normalize_upstream_url)

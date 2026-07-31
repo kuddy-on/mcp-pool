@@ -1,8 +1,10 @@
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
+from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, event
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -68,6 +70,7 @@ class AccountKeyModel(Base):
 
 class RequestLogModel(Base):
     __tablename__ = "request_logs"
+    __table_args__ = (Index("ix_request_logs_timestamp_key_id", "timestamp", "key_id"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     service_name: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
@@ -109,15 +112,27 @@ engine = create_async_engine(settings.database_url, echo=False)
 async_session = async_sessionmaker(engine, expire_on_commit=False)
 
 
-async def init_db() -> None:
-    import contextlib
+def _configure_sqlite_connection(
+    dbapi_connection: Any,  # noqa: ANN401 - SQLAlchemy supplies a driver-specific connection
+    _connection_record: Any,  # noqa: ANN401 - SQLAlchemy event protocol
+) -> None:
+    """Apply connection-local SQLite safety and contention settings."""
+    if not settings.database_url.startswith("sqlite"):
+        return
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA busy_timeout=5000")
+    finally:
+        cursor.close()
 
-    from sqlalchemy import text
 
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        # Dynamic migration for SQLite columns if missing
-        migrations = [
+event.listen(engine.sync_engine, "connect", _configure_sqlite_connection)
+
+SCHEMA_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
+    (
+        1,
+        (
             "ALTER TABLE mcp_services ADD COLUMN owner_id VARCHAR(36)",
             "ALTER TABLE request_logs ADD COLUMN key_name VARCHAR(64)",
             "ALTER TABLE request_logs ADD COLUMN client_key_name VARCHAR(64)",
@@ -130,10 +145,49 @@ async def init_db() -> None:
             "ALTER TABLE request_logs ADD COLUMN key_id VARCHAR(64)",
             "ALTER TABLE client_api_keys ADD COLUMN key_hint VARCHAR(32) DEFAULT ''",
             "ALTER TABLE users ADD COLUMN token_version INTEGER DEFAULT 0",
-        ]
-        for stmt in migrations:
-            with contextlib.suppress(Exception):
-                await conn.execute(text(stmt))
+        ),
+    ),
+    (
+        2,
+        (
+            "CREATE INDEX IF NOT EXISTS ix_request_logs_timestamp_key_id "
+            "ON request_logs (timestamp, key_id)",
+        ),
+    ),
+)
+
+
+async def init_db() -> None:
+    from sqlalchemy import text
+
+    async with engine.begin() as conn:
+        await conn.execute(text("PRAGMA journal_mode=WAL"))
+        await conn.execute(text("PRAGMA busy_timeout=5000"))
+        await conn.execute(text("PRAGMA foreign_keys=ON"))
+        await conn.execute(
+            text(
+                "CREATE TABLE IF NOT EXISTS schema_migrations ("
+                "version INTEGER PRIMARY KEY, "
+                "applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"
+                ")"
+            )
+        )
+        result = await conn.execute(text("SELECT COALESCE(MAX(version), 0) FROM schema_migrations"))
+        current_version = int(result.scalar_one())
+        await conn.run_sync(Base.metadata.create_all)
+        for version, statements in SCHEMA_MIGRATIONS:
+            if version <= current_version:
+                continue
+            for statement in statements:
+                try:
+                    await conn.execute(text(statement))
+                except OperationalError as exc:
+                    if "duplicate column name" not in str(exc).lower():
+                        raise
+            await conn.execute(
+                text("INSERT INTO schema_migrations (version) VALUES (:version)"),
+                {"version": version},
+            )
 
 
 async def get_db() -> AsyncIterator[AsyncSession]:

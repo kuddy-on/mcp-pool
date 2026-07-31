@@ -1,32 +1,22 @@
-# React + TypeScript + Vite
+# MCPPool dashboard
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+The dashboard is a React and TypeScript administration client served by an unprivileged nginx
+container. nginx proxies `/api/` to the gateway service.
 
-Currently, two official plugins are available:
-
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
-
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the Oxlint configuration
-
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
-
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
+```bash
+npm ci
+npm run dev
+npm run lint
+npm test
+npm run build
+npm run e2e
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+Authentication tokens are stored in `sessionStorage`, so they survive a reload in the current tab
+but are removed when the tab closes. Logout also calls the gateway revocation endpoint.
+
+Vitest covers the authentication state and Playwright exercises login and logout in desktop and
+mobile Chromium viewports.
+
+The production container listens on port 8080 and sends a restrictive Content Security Policy,
+clickjacking protection, MIME-sniffing protection, and privacy-oriented browser headers.

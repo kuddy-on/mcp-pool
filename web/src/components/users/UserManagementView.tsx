@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { Users, Plus, ShieldCheck, Trash2 } from 'lucide-react';
+import { apiRequest } from '../../api/client';
 import type { UserDTO } from '../../types';
 import { Button } from '../common/Button';
 import { Modal } from '../common/Modal';
@@ -9,7 +10,7 @@ export interface UserManagementViewProps {
   usersList: UserDTO[];
   currentUser: UserDTO | null;
   t: Record<string, string>;
-  authHeaders: () => HeadersInit;
+  token: string;
   fetchUsers: () => void;
 }
 
@@ -17,7 +18,7 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
   usersList,
   currentUser,
   t,
-  authHeaders,
+  token,
   fetchUsers,
 }) => {
   const [showAddUserModal, setShowAddUserModal] = useState(false);
@@ -33,22 +34,19 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
   const handleCreateUser = async () => {
     if (!newUserName || !newUserPassword) return;
     try {
-      const res = await fetch('/api/admin/users', {
+      await apiRequest('/api/admin/users', token, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({
           username: newUserName,
           password: newUserPassword,
           role: newUserRole,
         }),
       });
-      if (res.ok) {
-        setShowAddUserModal(false);
-        setNewUserName('');
-        setNewUserPassword('');
-        setNewUserRole('user');
-        fetchUsers();
-      }
+      setShowAddUserModal(false);
+      setNewUserName('');
+      setNewUserPassword('');
+      setNewUserRole('user');
+      fetchUsers();
     } catch (err) {
       console.error('Failed to create user', err);
     }
@@ -56,9 +54,8 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
 
   const handleDeleteUser = async (userId: string) => {
     try {
-      await fetch(`/api/admin/users/${userId}`, {
+      await apiRequest(`/api/admin/users/${userId}`, token, {
         method: 'DELETE',
-        headers: authHeaders(),
       });
       fetchUsers();
     } catch (err) {

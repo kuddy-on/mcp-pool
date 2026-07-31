@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+from uuid import uuid4
 
 import httpx
 import jwt
@@ -110,3 +111,30 @@ async def test_logout_revokes_existing_token() -> None:
         revoked_response = await client.get("/api/auth/me", headers=headers)
         assert revoked_response.status_code == 401
         assert revoked_response.json()["detail"] == "Access token has been revoked"
+
+
+@pytest.mark.asyncio
+async def test_login_rate_limit_blocks_repeated_failures() -> None:
+    app = create_app()
+    username = f"missing-{uuid4().hex}"
+
+    async with (
+        lifespan(app),
+        httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client,
+    ):
+        responses = [
+            await client.post(
+                "/api/auth/login",
+                json={"username": username, "password": "definitely-wrong"},
+            )
+            for _ in range(5)
+        ]
+        blocked = await client.post(
+            "/api/auth/login",
+            json={"username": username, "password": "definitely-wrong"},
+        )
+
+    assert [response.status_code for response in responses[:4]] == [401] * 4
+    assert responses[4].status_code == 429
+    assert blocked.status_code == 429
+    assert int(blocked.headers["retry-after"]) > 0

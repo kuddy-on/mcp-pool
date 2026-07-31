@@ -5,6 +5,7 @@ from mcp_pool.providers.base import (
     ProviderSignal,
     ProviderSignalKind,
     parse_retry_after,
+    sanitize_request_headers,
 )
 
 
@@ -23,9 +24,7 @@ class GenericHeaderProviderAdapter(ProviderAdapter):
 
     def prepare_headers(self, credential: str, headers: httpx.Headers) -> httpx.Headers:
         """Inject API key into configured header."""
-        new_headers = httpx.Headers(headers)
-        new_headers.pop("host", None)
-        new_headers.pop("content-length", None)
+        new_headers = sanitize_request_headers(headers)
 
         if self.auth_prefix and not credential.startswith(self.auth_prefix):
             value = f"{self.auth_prefix}{credential}"

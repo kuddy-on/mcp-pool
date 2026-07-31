@@ -1,13 +1,15 @@
 import asyncio
 import json
+import logging
 import math
 import time
-from collections.abc import Mapping, Sequence
+from collections import OrderedDict
+from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import selectinload
 
 from mcp_pool.config import get_settings
@@ -26,196 +28,30 @@ from mcp_pool.db import (
     UserModel,
     async_session,
 )
-from mcp_pool.domain.admin import KeyResponse, RequestLogItem, ServiceResponse
+from mcp_pool.domain.admin import RequestLogItem, ServiceResponse
 from mcp_pool.domain.service import ServiceConfig
-from mcp_pool.providers.base import ProviderAdapter, ProviderSignalKind
-from mcp_pool.providers.context7 import Context7ProviderAdapter
-from mcp_pool.providers.generic import GenericHeaderProviderAdapter
+from mcp_pool.key_pool import AccountKey as AccountKey
+from mcp_pool.key_pool import KeyPoolManager as KeyPoolManager
+from mcp_pool.key_pool import get_provider_adapter
+from mcp_pool.providers.base import ProviderSignalKind
 
 PROVIDER_QUOTA_MAX_CONCURRENCY = 5
+logger = logging.getLogger(__name__)
 
 
-@dataclass
-class AccountKey:
+@dataclass(slots=True)
+class SessionBinding:
+    service_id: str
     key_id: str
-    name: str
-    secret_key: str
-    is_active: bool = True
-    quota_exhausted: bool = False
-    paused_until: datetime | None = None
-    weight: float = 1.0
-    fail_count: int = 0
-    requests_count: int = 0
-    last_used: datetime | None = None
-    monthly_quota: int = 0  # 0 = unlimited
-    used_offset: int = 0  # manual offset for external usage
-    provider_quota_snapshot: str | None = None
-    provider_quota_error: str | None = None
-
-    def is_available(self, now: datetime | None = None, used_this_month: int = 0) -> bool:
-        current_time = now or datetime.now(UTC)
-        if not self.is_active or self.quota_exhausted:
-            return False
-        if self.monthly_quota > 0 and used_this_month >= self.monthly_quota:
-            return False
-        paused_until = self.paused_until
-        if paused_until and paused_until.tzinfo is None:
-            paused_until = paused_until.replace(tzinfo=UTC)
-        return not (paused_until and paused_until > current_time)
-
-    def mask_key(self) -> str:
-        if len(self.secret_key) <= 8:
-            return "****"
-        return f"{self.secret_key[:4]}...{self.secret_key[-4:]}"
-
-    def to_response(self, monthly_usage: Mapping[str, int] | None = None) -> KeyResponse:
-        log_count = (monthly_usage or {}).get(self.key_id, 0)
-        total_used = log_count + self.used_offset
-        return KeyResponse(
-            id=self.key_id,
-            name=self.name,
-            key_masked=self.mask_key(),
-            is_active=self.is_active,
-            quota_exhausted=self.quota_exhausted,
-            paused_until=self.paused_until,
-            weight=self.weight,
-            fail_count=self.fail_count,
-            requests_count=self.requests_count,
-            last_used=self.last_used,
-            monthly_quota=self.monthly_quota,
-            used_this_month=total_used,
-        )
-
-
-def get_provider_adapter(service_config: ServiceConfig) -> ProviderAdapter:
-    ptype = service_config.provider_type.lower()
-    if ptype == "context7":
-        return Context7ProviderAdapter()
-    return GenericHeaderProviderAdapter(
-        name=service_config.name,
-        auth_header=service_config.auth_header,
-        auth_prefix=service_config.auth_prefix,
-    )
-
-
-class KeyPoolManager:
-    """Manages key rotation and failover for a single upstream service."""
-
-    def __init__(self, service_id: str, service_config: ServiceConfig, owner_id: str | None = None):
-        self.service_id = service_id
-        self.service_name = service_config.name
-        self.upstream_url = service_config.upstream_url.rstrip("/")
-        self.provider_type = service_config.provider_type
-        self.auth_header = service_config.auth_header
-        self.auth_prefix = service_config.auth_prefix
-        self.owner_id = owner_id
-        self.provider_adapter = get_provider_adapter(service_config)
-
-        self.keys: list[AccountKey] = [
-            AccountKey(
-                key_id=f"{service_config.name}-key-{i + 1}",
-                name=f"Key-{i + 1}",
-                secret_key=k,
-            )
-            for i, k in enumerate(service_config.api_keys)
-        ]
-        self._current_index: int = 0
-
-    def add_key(
-        self, secret_key: str, name: str | None = None, weight: float = 1.0, monthly_quota: int = 0
-    ) -> AccountKey:
-        kid = f"{self.service_name}-key-{len(self.keys) + 1}-{uuid4().hex[:4]}"
-        kname = name or f"Key-{len(self.keys) + 1}"
-        acc_key = AccountKey(
-            key_id=kid,
-            name=kname,
-            secret_key=secret_key,
-            weight=weight,
-            monthly_quota=monthly_quota,
-        )
-        self.keys.append(acc_key)
-        return acc_key
-
-    def get_current_key(
-        self,
-        monthly_usage: Mapping[str, int] | None = None,
-        excluded_key_ids: set[str] | None = None,
-    ) -> AccountKey | None:
-        if not self.keys:
-            return None
-        now = datetime.now(UTC)
-        usage = monthly_usage or {}
-        excluded = excluded_key_ids or set()
-        for i in range(len(self.keys)):
-            idx = (self._current_index + i) % len(self.keys)
-            key = self.keys[idx]
-            used_this_month = usage.get(key.key_id, 0) + key.used_offset
-            if key.key_id not in excluded and key.is_available(now, used_this_month):
-                self._current_index = (idx + 1) % len(self.keys)
-                return key
-        return None
-
-    def mark_signal(
-        self, key_id: str, kind: ProviderSignalKind, retry_at: datetime | None = None
-    ) -> AccountKey | None:
-        now = datetime.now(UTC)
-        for key in self.keys:
-            if key.key_id == key_id:
-                key.requests_count += 1
-                key.last_used = now
-                if kind in (ProviderSignalKind.QUOTA_EXHAUSTED, ProviderSignalKind.AUTH_INVALID):
-                    key.quota_exhausted = True
-                    key.is_active = False
-                elif kind == ProviderSignalKind.RATE_LIMITED:
-                    key.paused_until = retry_at
-                elif kind == ProviderSignalKind.SUCCESS:
-                    key.fail_count = 0
-                else:
-                    key.fail_count += 1
-                return key
-        return None
-
-    def get_service_status(self, monthly_usage: Mapping[str, int] | None = None) -> str:
-        if not self.keys:
-            return "unavailable"
-        usage = monthly_usage or {}
-        active_count = sum(
-            1
-            for key in self.keys
-            if key.is_available(used_this_month=usage.get(key.key_id, 0) + key.used_offset)
-        )
-        if active_count == len(self.keys):
-            return "active"
-        if active_count > 0:
-            return "degraded"
-        return "unavailable"
-
-    def to_response(self, monthly_usage: Mapping[str, int] | None = None) -> ServiceResponse:
-        usage = monthly_usage or {}
-        active_keys = sum(
-            1
-            for k in self.keys
-            if k.is_available(used_this_month=usage.get(k.key_id, 0) + k.used_offset)
-        )
-        return ServiceResponse(
-            id=self.service_id,
-            name=self.service_name,
-            upstream_url=self.upstream_url,
-            provider_type=self.provider_type,
-            auth_header=self.auth_header,
-            auth_prefix=self.auth_prefix,
-            total_keys=len(self.keys),
-            active_keys=active_keys,
-            status=self.get_service_status(usage),
-            keys=[k.to_response(monthly_usage) for k in self.keys],
-        )
+    last_seen: float
 
 
 class KeyPoolRegistry:
     """Registry holding KeyPoolManagers, Client API Keys, System Settings and SQLite DB Syncing."""
 
     def __init__(self, default_services: Sequence[ServiceConfig]):
-        self._application_secret = get_settings().secret_key.get_secret_value()
+        self._settings = get_settings()
+        self._application_secret = self._settings.secret_key.get_secret_value()
         self._secret_cipher = SecretCipher(self._application_secret)
         self._managers: dict[str, KeyPoolManager] = {}
         self._default_services = default_services
@@ -228,6 +64,14 @@ class KeyPoolRegistry:
         self._provider_quota_refresh_inflight: set[str] = set()
         self._provider_quota_refresh_last_started: dict[str, float] = {}
         self._provider_quota_state_locks: dict[str, asyncio.Lock] = {}
+        self._session_bindings: OrderedDict[tuple[str, str], SessionBinding] = OrderedDict()
+        self._session_bindings_lock = asyncio.Lock()
+        self._quota_reservations: dict[str, int] = {}
+        self._quota_reservations_lock = asyncio.Lock()
+        self._monthly_usage_cache: dict[str, int] = {}
+        self._monthly_usage_month: tuple[int, int] | None = None
+        self._monthly_usage_lock = asyncio.Lock()
+        self._last_log_prune_at = 0.0
 
     def provider_quota_state_lock(self, key_id: str) -> asyncio.Lock:
         """Return the single-process lock protecting one key's quota state and persistence."""
@@ -282,15 +126,27 @@ class KeyPoolRegistry:
         """Load persistent records from SQLite DB or seed default admin user."""
         from mcp_pool.auth import hash_password
 
+        await self.prune_request_logs()
+        self._last_log_prune_at = time.monotonic()
         async with async_session() as session:
             # Seed default admin user if no user exists
             stmt_usr = select(UserModel)
             res_usr = await session.execute(stmt_usr)
             users = res_usr.scalars().all()
             if not users:
+                configured_password = self._settings.initial_admin_password
+                if configured_password is None and self._settings.environment != "test":
+                    raise RuntimeError(
+                        "MCP_POOL_INITIAL_ADMIN_PASSWORD is required for first startup"
+                    )
+                initial_password = (
+                    configured_password.get_secret_value()
+                    if configured_password is not None
+                    else "admin123"
+                )
                 admin_usr = UserModel(
-                    username="admin",
-                    password_hash=hash_password("admin123"),
+                    username=self._settings.initial_admin_username,
+                    password_hash=hash_password(initial_password),
                     role="admin",
                 )
                 session.add(admin_usr)
@@ -426,6 +282,7 @@ class KeyPoolRegistry:
                     await session.commit()
                 if db_services:
                     self._default_service_name = db_services[0].name
+        await self.get_monthly_usage()
 
     def get_manager(self, service_name: str | None = None) -> KeyPoolManager | None:
         if service_name is not None:
@@ -476,27 +333,46 @@ class KeyPoolRegistry:
             self._default_service_name = service_config.name
         return mgr
 
-    async def update_service_in_db(self, manager: KeyPoolManager) -> None:
+    async def update_service(
+        self,
+        manager: KeyPoolManager,
+        *,
+        upstream_url: str | None = None,
+        provider_type: str | None = None,
+        auth_header: str | None = None,
+        auth_prefix: str | None = None,
+    ) -> KeyPoolManager:
+        """Commit service changes before publishing them to the live registry."""
+        next_upstream_url = (upstream_url or manager.upstream_url).rstrip("/")
+        next_provider_type = provider_type or manager.provider_type
+        next_auth_header = auth_header or manager.auth_header
+        next_auth_prefix = auth_prefix if auth_prefix is not None else manager.auth_prefix
+        next_config = ServiceConfig(
+            name=manager.service_name,
+            upstream_url=next_upstream_url,
+            provider_type=next_provider_type,
+            auth_header=next_auth_header,
+            auth_prefix=next_auth_prefix,
+        )
         async with async_session() as session:
             stmt = select(ServiceModel).where(ServiceModel.id == manager.service_id)
             result = await session.execute(stmt)
             service = result.scalar_one_or_none()
             if service:
-                service.upstream_url = manager.upstream_url
-                service.provider_type = manager.provider_type
-                service.auth_header = manager.auth_header
-                service.auth_prefix = manager.auth_prefix
+                service.upstream_url = next_upstream_url
+                service.provider_type = next_provider_type
+                service.auth_header = next_auth_header
+                service.auth_prefix = next_auth_prefix
                 await session.commit()
+            else:
+                raise LookupError("Service not found")
 
-        manager.provider_adapter = get_provider_adapter(
-            ServiceConfig(
-                name=manager.service_name,
-                upstream_url=manager.upstream_url,
-                provider_type=manager.provider_type,
-                auth_header=manager.auth_header,
-                auth_prefix=manager.auth_prefix,
-            )
-        )
+        manager.upstream_url = next_upstream_url
+        manager.provider_type = next_provider_type
+        manager.auth_header = next_auth_header
+        manager.auth_prefix = next_auth_prefix
+        manager.provider_adapter = get_provider_adapter(next_config)
+        return manager
 
     async def remove_service(self, service_name_or_id: str) -> bool:
         target_name = None
@@ -534,8 +410,12 @@ class KeyPoolRegistry:
         if not mgr:
             return None
 
-        key = mgr.add_key(
-            secret_key=secret_key, name=name, weight=weight, monthly_quota=monthly_quota
+        key = AccountKey(
+            key_id=str(uuid4()),
+            name=name or f"Key {len(mgr.keys) + 1}",
+            secret_key=secret_key,
+            weight=weight,
+            monthly_quota=monthly_quota,
         )
         async with async_session() as session:
             k_model = AccountKeyModel(
@@ -550,27 +430,48 @@ class KeyPoolRegistry:
             session.add(k_model)
             await session.commit()
 
+        mgr.keys.append(key)
         return key
 
-    async def update_key_in_db(self, key_id: str, account_key: AccountKey) -> None:
+    async def update_key_in_db(self, key_id: str, account_key: AccountKey) -> bool:
         async with async_session() as session:
             stmt = select(AccountKeyModel).where(AccountKeyModel.id == key_id)
             res = await session.execute(stmt)
             km = res.scalar_one_or_none()
-            if km:
-                km.name = account_key.name
-                km.secret_key = self._secret_cipher.encrypt(account_key.secret_key)
-                km.is_active = account_key.is_active
-                km.quota_exhausted = account_key.quota_exhausted
-                km.paused_until = account_key.paused_until
-                km.weight = account_key.weight
-                km.fail_count = account_key.fail_count
-                km.requests_count = account_key.requests_count
-                km.last_used = account_key.last_used
-                km.monthly_quota = account_key.monthly_quota
-                km.used_offset = account_key.used_offset
-                km.provider_quota_snapshot = account_key.provider_quota_snapshot
-                km.provider_quota_error = account_key.provider_quota_error
+            if not km:
+                return False
+            km.name = account_key.name
+            km.secret_key = self._secret_cipher.encrypt(account_key.secret_key)
+            km.is_active = account_key.is_active
+            km.quota_exhausted = account_key.quota_exhausted
+            km.paused_until = account_key.paused_until
+            km.weight = account_key.weight
+            km.fail_count = account_key.fail_count
+            km.requests_count = account_key.requests_count
+            km.last_used = account_key.last_used
+            km.monthly_quota = account_key.monthly_quota
+            km.used_offset = account_key.used_offset
+            km.provider_quota_snapshot = account_key.provider_quota_snapshot
+            km.provider_quota_error = account_key.provider_quota_error
+            await session.commit()
+            return True
+
+    async def update_key_runtime_state(self, key_id: str, account_key: AccountKey) -> None:
+        """Persist hot-path state without rewriting or re-encrypting the credential."""
+        async with async_session() as session:
+            stmt = select(AccountKeyModel).where(AccountKeyModel.id == key_id)
+            res = await session.execute(stmt)
+            key_model = res.scalar_one_or_none()
+            if key_model:
+                key_model.is_active = account_key.is_active
+                key_model.quota_exhausted = account_key.quota_exhausted
+                key_model.paused_until = account_key.paused_until
+                key_model.fail_count = account_key.fail_count
+                key_model.requests_count = account_key.requests_count
+                key_model.last_used = account_key.last_used
+                key_model.used_offset = account_key.used_offset
+                key_model.provider_quota_snapshot = account_key.provider_quota_snapshot
+                key_model.provider_quota_error = account_key.provider_quota_error
                 await session.commit()
 
     async def update_provider_quota_states_in_db(
@@ -607,7 +508,10 @@ class KeyPoolRegistry:
     ) -> AccountKey | None:
         key = manager.mark_signal(key_id, kind, retry_at)
         if key is not None:
-            await self.update_key_in_db(key_id, key)
+            try:
+                await self.update_key_runtime_state(key_id, key)
+            except Exception:
+                logger.exception("Failed to persist upstream key state", extra={"key_id": key_id})
         return key
 
     async def delete_key_from_db(self, service_id: str, key_id: str) -> bool:
@@ -615,7 +519,6 @@ class KeyPoolRegistry:
         if not mgr:
             return False
 
-        mgr.keys = [k for k in mgr.keys if k.key_id != key_id]
         async with async_session() as session:
             stmt = select(AccountKeyModel).where(AccountKeyModel.id == key_id)
             res = await session.execute(stmt)
@@ -623,13 +526,14 @@ class KeyPoolRegistry:
             if km:
                 await session.delete(km)
                 await session.commit()
+            else:
+                return False
+        mgr.keys = [k for k in mgr.keys if k.key_id != key_id]
         return True
 
-    async def get_monthly_usage(self) -> dict[str, int]:
-        """Compute monthly request usage by stable account key ID."""
+    async def _load_monthly_usage(self) -> dict[str, int]:
         now = datetime.now(UTC)
         month_start = datetime(now.year, now.month, 1, tzinfo=UTC)
-
         async with async_session() as session:
             stmt = (
                 select(
@@ -660,6 +564,98 @@ class KeyPoolRegistry:
                 if resolved_key_id:
                     usage[resolved_key_id] = usage.get(resolved_key_id, 0) + count
             return usage
+
+    async def get_monthly_usage(self) -> dict[str, int]:
+        """Return the in-process monthly ledger, loading SQLite once per month."""
+        now = datetime.now(UTC)
+        current_month = (now.year, now.month)
+        async with self._monthly_usage_lock:
+            if self._monthly_usage_month != current_month:
+                self._monthly_usage_cache = await self._load_monthly_usage()
+                self._monthly_usage_month = current_month
+            return dict(self._monthly_usage_cache)
+
+    async def reserve_key(
+        self,
+        manager: KeyPoolManager,
+        excluded_key_ids: set[str],
+        *,
+        preferred_key_id: str | None = None,
+    ) -> AccountKey | None:
+        """Select and reserve quota atomically within this single-node process."""
+        async with self._quota_reservations_lock:
+            effective_usage = await self.get_monthly_usage()
+            for key_id, count in self._quota_reservations.items():
+                effective_usage[key_id] = effective_usage.get(key_id, 0) + count
+            key = manager.get_current_key(
+                effective_usage,
+                excluded_key_ids,
+                preferred_key_id=preferred_key_id,
+            )
+            if key is not None:
+                self._quota_reservations[key.key_id] = (
+                    self._quota_reservations.get(key.key_id, 0) + 1
+                )
+            return key
+
+    async def release_key_reservation(self, key_id: str) -> None:
+        async with self._quota_reservations_lock:
+            count = self._quota_reservations.get(key_id, 0)
+            if count <= 1:
+                self._quota_reservations.pop(key_id, None)
+            else:
+                self._quota_reservations[key_id] = count - 1
+
+    async def get_session_key_id(self, session_id: str, service_id: str) -> str | None:
+        """Resolve a live MCP session to its original upstream key."""
+        now = time.monotonic()
+        ttl = self._settings.session_affinity_ttl_seconds
+        binding_key = (service_id, session_id)
+        async with self._session_bindings_lock:
+            binding = self._session_bindings.get(binding_key)
+            if binding is None:
+                return None
+            if now - binding.last_seen > ttl:
+                self._session_bindings.pop(binding_key, None)
+                return None
+            binding.last_seen = now
+            self._session_bindings.move_to_end(binding_key)
+            return binding.key_id
+
+    async def bind_session(self, session_id: str, service_id: str, key_id: str) -> None:
+        now = time.monotonic()
+        binding_key = (service_id, session_id)
+        async with self._session_bindings_lock:
+            if (
+                binding_key not in self._session_bindings
+                and len(self._session_bindings) >= self._settings.session_affinity_max_entries
+            ):
+                self._session_bindings.popitem(last=False)
+            self._session_bindings[binding_key] = SessionBinding(
+                service_id=service_id,
+                key_id=key_id,
+                last_seen=now,
+            )
+            self._session_bindings.move_to_end(binding_key)
+
+    async def unbind_session(self, session_id: str, service_id: str) -> None:
+        async with self._session_bindings_lock:
+            self._session_bindings.pop((service_id, session_id), None)
+
+    async def prune_request_logs(self) -> int:
+        """Delete audit rows older than the configured retention window."""
+        now = datetime.now(UTC)
+        retention_cutoff = now - timedelta(days=self._settings.request_log_retention_days)
+        month_start = datetime(now.year, now.month, 1, tzinfo=UTC)
+        # Request logs currently back the durable monthly quota ledger. Preserve the
+        # whole current month even when the configured audit retention is shorter.
+        cutoff = min(retention_cutoff, month_start)
+        async with async_session() as session:
+            result = await session.execute(
+                delete(RequestLogModel).where(RequestLogModel.timestamp < cutoff)
+            )
+            await session.commit()
+            return int(getattr(result, "rowcount", 0) or 0)
 
     async def list_services_async(
         self, user_id: str | None = None, is_admin: bool = False
@@ -694,25 +690,49 @@ class KeyPoolRegistry:
         if len(self._logs) > 200:
             self._logs.pop(0)
 
-        async with async_session() as session:
-            log_model = RequestLogModel(
-                id=log_item.id,
-                service_name=log_item.service_name,
-                timestamp=log_item.timestamp,
-                method=log_item.method,
-                path=log_item.path,
-                mcp_method=log_item.mcp_method,
-                key_id=log_item.key_id,
-                key_name=log_item.key_name,
-                client_key_name=log_item.client_key_name,
-                client_ip=log_item.client_ip,
-                status_code=log_item.status_code,
-                signal_kind=log_item.signal_kind,
-                duration_ms=log_item.duration_ms,
-                failover_chain=json.dumps(log_item.failover_chain),
+        try:
+            async with async_session() as session:
+                log_model = RequestLogModel(
+                    id=log_item.id,
+                    service_name=log_item.service_name,
+                    timestamp=log_item.timestamp,
+                    method=log_item.method,
+                    path=log_item.path,
+                    mcp_method=log_item.mcp_method,
+                    key_id=log_item.key_id,
+                    key_name=log_item.key_name,
+                    client_key_name=log_item.client_key_name,
+                    client_ip=log_item.client_ip,
+                    status_code=log_item.status_code,
+                    signal_kind=log_item.signal_kind,
+                    duration_ms=log_item.duration_ms,
+                    failover_chain=json.dumps(log_item.failover_chain),
+                )
+                session.add(log_model)
+                await session.commit()
+        except Exception:
+            logger.exception(
+                "Failed to persist request audit log",
+                extra={"request_id": log_item.id},
             )
-            session.add(log_model)
-            await session.commit()
+        if log_item.key_id is not None:
+            timestamp = log_item.timestamp
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=UTC)
+            now = datetime.now(UTC)
+            current_month = (now.year, now.month)
+            if (timestamp.year, timestamp.month) == current_month:
+                async with self._monthly_usage_lock:
+                    if self._monthly_usage_month == current_month:
+                        self._monthly_usage_cache[log_item.key_id] = (
+                            self._monthly_usage_cache.get(log_item.key_id, 0) + 1
+                        )
+        if time.monotonic() - self._last_log_prune_at >= 24 * 60 * 60:
+            self._last_log_prune_at = time.monotonic()
+            try:
+                await self.prune_request_logs()
+            except Exception:
+                logger.exception("Failed to prune expired request audit logs")
 
     def get_logs(
         self,
@@ -727,11 +747,11 @@ class KeyPoolRegistry:
     def validate_client_key(self, raw_token: str | None) -> str | None:
         """Validate client key and return the key name, or None if invalid.
 
-        Returns empty string when no client keys are configured (open access).
+        Returns empty string only when anonymous gateway access is explicitly enabled.
         Returns the key name if valid. Returns None if invalid.
         """
         if not self._client_keys:
-            return ""  # open access
+            return "" if self._settings.allow_anonymous_gateway else None
         if not raw_token:
             return None
         clean_token = raw_token.replace("Bearer ", "").strip()
@@ -739,7 +759,7 @@ class KeyPoolRegistry:
         return self._client_keys.get(key_hash)
 
     async def update_external_url(self, new_url: str) -> None:
-        self.gateway_external_url = new_url.rstrip("/")
+        normalized_url = new_url.rstrip("/")
         async with async_session() as session:
             stmt = select(SystemSettingModel).where(
                 SystemSettingModel.key == "gateway_external_url"
@@ -747,13 +767,12 @@ class KeyPoolRegistry:
             res = await session.execute(stmt)
             setting = res.scalar_one_or_none()
             if not setting:
-                setting = SystemSettingModel(
-                    key="gateway_external_url", value=self.gateway_external_url
-                )
+                setting = SystemSettingModel(key="gateway_external_url", value=normalized_url)
                 session.add(setting)
             else:
-                setting.value = self.gateway_external_url
+                setting.value = normalized_url
             await session.commit()
+        self.gateway_external_url = normalized_url
 
     async def create_client_api_key(self, name: str) -> tuple[ClientApiKeyModel, str]:
         raw_key = f"mcp_live_{uuid4().hex}"
@@ -782,8 +801,9 @@ class KeyPoolRegistry:
             res = await session.execute(stmt)
             ck = res.scalar_one_or_none()
             if ck:
-                self._client_keys.pop(ck.api_key, None)
+                key_hash = ck.api_key
                 await session.delete(ck)
                 await session.commit()
+                self._client_keys.pop(key_hash, None)
                 return True
         return False

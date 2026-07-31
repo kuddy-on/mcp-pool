@@ -1,11 +1,14 @@
 import time
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Annotated, Any
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from mcp_pool.auth import UserDTO, get_current_user, require_admin
+from mcp_pool.config import get_settings
 from mcp_pool.domain.admin import (
     ClientApiKeyCreateRequest,
     ClientApiKeyResponse,
@@ -21,7 +24,7 @@ from mcp_pool.domain.admin import (
     TestResultItem,
 )
 from mcp_pool.domain.quota import ProviderQuotaServiceResponse
-from mcp_pool.domain.service import ServiceConfig
+from mcp_pool.domain.service import ServiceConfig, is_private_upstream
 from mcp_pool.pool import KeyPoolManager, KeyPoolRegistry
 from mcp_pool.providers.base import ProviderSignalKind
 from mcp_pool.providers.context7 import Context7ProviderAdapter
@@ -47,6 +50,24 @@ def get_registry() -> KeyPoolRegistry:
     if registry is None:
         raise HTTPException(status_code=503, detail="Registry not initialized")
     return registry
+
+
+def ensure_upstream_allowed(upstream_url: str) -> None:
+    settings = get_settings()
+    if settings.environment == "production" and not upstream_url.startswith("https://"):
+        raise HTTPException(status_code=422, detail="Production upstreams must use HTTPS")
+    hostname = (urlsplit(upstream_url).hostname or "").rstrip(".").lower()
+    allowed_hosts = {host.rstrip(".").lower() for host in settings.upstream_allowed_hosts}
+    if settings.environment == "production" and hostname not in allowed_hosts:
+        raise HTTPException(
+            status_code=422,
+            detail="Upstream host is not present in MCP_POOL_UPSTREAM_ALLOWED_HOSTS",
+        )
+    if not settings.allow_private_upstreams and is_private_upstream(upstream_url):
+        raise HTTPException(
+            status_code=422,
+            detail="Private, loopback, link-local, and reserved upstream addresses are disabled",
+        )
 
 
 def get_authorized_manager(
@@ -92,9 +113,11 @@ async def list_services(
 
 @router.post("/services", response_model=ServiceResponse)
 async def create_service(
-    req: ServiceCreateRequest, user: Annotated[UserDTO, Depends(get_current_user)]
+    req: ServiceCreateRequest,
+    admin: Annotated[UserDTO, Depends(require_admin)],
 ) -> ServiceResponse:
     reg = get_registry()
+    ensure_upstream_allowed(req.upstream_url)
     if reg.get_manager_by_name(req.name):
         raise HTTPException(status_code=400, detail=f"Service '{req.name}' already exists")
 
@@ -106,7 +129,7 @@ async def create_service(
         auth_prefix=req.auth_prefix,
         api_keys=req.api_keys,
     )
-    mgr = await reg.add_service(cfg, owner_id=user.id)
+    mgr = await reg.add_service(cfg, owner_id=admin.id)
     return mgr.to_response()
 
 
@@ -182,21 +205,20 @@ async def refresh_service_quota_status(
 async def update_service(
     service_id: str,
     req: ServiceUpdateRequest,
-    user: Annotated[UserDTO, Depends(get_current_user)],
+    admin: Annotated[UserDTO, Depends(require_admin)],
 ) -> ServiceResponse:
     reg = get_registry()
-    mgr = get_authorized_manager(service_id, user, write=True)
+    mgr = get_authorized_manager(service_id, admin, write=True)
 
     if req.upstream_url is not None:
-        mgr.upstream_url = req.upstream_url.rstrip("/")
-    if req.provider_type is not None:
-        mgr.provider_type = req.provider_type
-    if req.auth_header is not None:
-        mgr.auth_header = req.auth_header
-    if req.auth_prefix is not None:
-        mgr.auth_prefix = req.auth_prefix
-
-    await reg.update_service_in_db(mgr)
+        ensure_upstream_allowed(req.upstream_url)
+    mgr = await reg.update_service(
+        mgr,
+        upstream_url=req.upstream_url,
+        provider_type=req.provider_type,
+        auth_header=req.auth_header,
+        auth_prefix=req.auth_prefix,
+    )
     usage = await reg.get_monthly_usage()
     return mgr.to_response(usage)
 
@@ -254,34 +276,41 @@ async def update_key(
     reg = get_registry()
     mgr = get_authorized_manager(service_id, user, write=True)
 
-    target_key = next((k for k in mgr.keys if k.key_id == key_id), None)
-    if not target_key:
-        raise HTTPException(status_code=404, detail="Key not found")
-
     async with reg.provider_quota_state_lock(key_id):
+        target_index = next(
+            (index for index, key in enumerate(mgr.keys) if key.key_id == key_id),
+            None,
+        )
+        if target_index is None:
+            raise HTTPException(status_code=404, detail="Key not found")
+        target_key = mgr.keys[target_index]
+        updated_key = replace(target_key)
         if req.name is not None:
-            target_key.name = req.name
+            updated_key.name = req.name
         if req.secret_key is not None:
-            target_key.secret_key = req.secret_key
-            target_key.provider_quota_snapshot = None
-            target_key.provider_quota_error = None
-            await reg.reset_provider_quota_refresh_cooldown(key_id)
+            updated_key.secret_key = req.secret_key
+            updated_key.provider_quota_snapshot = None
+            updated_key.provider_quota_error = None
         if req.weight is not None:
-            target_key.weight = req.weight
+            updated_key.weight = req.weight
         if req.monthly_quota is not None:
-            target_key.monthly_quota = req.monthly_quota
+            updated_key.monthly_quota = req.monthly_quota
         if req.used_this_month is not None:
             usage = await reg.get_monthly_usage()
-            log_count = usage.get(target_key.key_id, 0)
-            target_key.used_offset = req.used_this_month - log_count
+            log_count = usage.get(updated_key.key_id, 0)
+            updated_key.used_offset = req.used_this_month - log_count
         if req.is_active is not None:
-            target_key.is_active = req.is_active
+            updated_key.is_active = req.is_active
             if req.is_active:
-                target_key.quota_exhausted = False
+                updated_key.quota_exhausted = False
 
-        await reg.update_key_in_db(key_id, target_key)
+        if not await reg.update_key_in_db(key_id, updated_key):
+            raise HTTPException(status_code=404, detail="Key not found in persistent store")
+        mgr.keys[target_index] = updated_key
+        if req.secret_key is not None:
+            await reg.reset_provider_quota_refresh_cooldown(key_id)
     usage = await reg.get_monthly_usage()
-    return target_key.to_response(usage)
+    return updated_key.to_response(usage)
 
 
 @router.delete("/services/{service_id}/keys/{key_id}")
