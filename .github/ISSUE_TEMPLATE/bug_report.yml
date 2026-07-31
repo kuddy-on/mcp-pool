@@ -1,0 +1,27 @@
+name: Bug report
+description: Report a reproducible MCPPool defect
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    attributes:
+      label: What happened?
+      description: Include expected behavior, actual behavior, and impact.
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: Version
+      placeholder: v0.1.0 or commit SHA
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Reproduction
+      description: Provide minimal steps with secrets removed.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Environment
+      description: OS, Python, deployment mode, provider, and relevant configuration.

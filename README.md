@@ -4,7 +4,8 @@
 
 MCPPool exposes one stable MCP endpoint in front of multiple API-key accounts for the same
 upstream service. It rotates eligible accounts, enforces configured monthly quotas, persists
-account health in SQLite, and fails over only when retrying is safe.
+account health in SQLite, keeps MCP sessions on their original account, and fails over only when
+retrying is safe.
 
 > [!IMPORTANT]
 > MCPPool currently targets a simple single-node deployment backed by SQLite. Context7 is the
@@ -56,13 +57,19 @@ The project has two logical paths:
 | Administration UI | React + Vite + nginx |
 | Quality | Ruff, mypy, pytest |
 
-See [docs/architecture.md](docs/architecture.md) and the [architecture decisions](docs/adr/) for the reasoning behind these choices.
+See [docs/architecture.md](docs/architecture.md), the [architecture decisions](docs/adr/), and the
+[operations runbook](docs/operations.md) for design and production procedures.
 
 ## Routing model
 
 Each configured API key is currently one independently routed account. Eligible keys are selected
-round-robin. A key is excluded when it is disabled, rejected by the upstream, inside a rate-limit
-cooldown, or at its configured monthly quota.
+smooth weighted round-robin. A key is excluded when it is disabled, rejected by the upstream,
+inside a rate-limit cooldown, or at its configured monthly quota. In-flight requests reserve quota
+inside the single gateway process so concurrent requests cannot all claim the final local unit.
+
+When an upstream returns `Mcp-Session-Id`, MCPPool binds that session to the selected service key.
+Bindings are process-local, bounded, and expire after 24 hours by default. A deployment restart
+therefore invalidates affinity for existing upstream sessions.
 
 Explicit upstream rejections (`401`, `403`, or `429`) may fail over to another account. Ambiguous
 failures such as connection loss or `5xx` responses are retried only for HTTP/MCP operations known
@@ -114,6 +121,9 @@ Prerequisites:
 
 ```bash
 cp .env.example .env
+# Set two unique secrets in .env before the first startup:
+# MCP_POOL_SECRET_KEY=$(openssl rand -hex 32)
+# MCP_POOL_INITIAL_ADMIN_PASSWORD=$(openssl rand -base64 24)
 uv sync --all-groups
 uv run mcp-pool serve --reload
 ```
@@ -129,6 +139,7 @@ Then open:
 - `http://127.0.0.1:8000/health/live`
 - `http://127.0.0.1:8000/health/ready`
 - `http://127.0.0.1:8000/docs` for a direct development run
+- `http://127.0.0.1:8000/metrics` for Prometheus metrics
 - `http://127.0.0.1:3000` for the Docker dashboard
 - `http://127.0.0.1:8100/health/ready` for the Docker gateway
 
@@ -137,9 +148,42 @@ Run checks:
 ```bash
 uv run ruff check .
 uv run ruff format --check .
-uv run mypy src
-uv run pytest
+uv run mypy src tests
+uv run pytest --cov=mcp_pool --cov-fail-under=85
+cd web
+npm ci
+npm run lint
+npm test
+npm run build
+npm run e2e
 ```
+
+On first startup, sign in with username `admin` and the password supplied through
+`MCP_POOL_INITIAL_ADMIN_PASSWORD`, then create a Gateway API key under Settings. Proxy requests are
+denied when no Gateway API key exists. Anonymous proxying requires the explicit
+`MCP_POOL_ALLOW_ANONYMOUS_GATEWAY=true` escape hatch and is not recommended.
+
+## Production configuration
+
+Production mode refuses the documented default secret and secrets shorter than 32 characters.
+OpenAPI and interactive documentation are also disabled. Relevant settings include:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `MCP_POOL_SECRET_KEY` | development-only value | Encryption, signing, and key-digest root secret |
+| `MCP_POOL_INITIAL_ADMIN_PASSWORD` | unset | Required only while creating the first user |
+| `MCP_POOL_ALLOW_ANONYMOUS_GATEWAY` | `false` | Permit proxying without a Gateway API key |
+| `MCP_POOL_TRUST_PROXY_HEADERS` | `false` | Trust the first `X-Forwarded-For` value |
+| `MCP_POOL_ALLOW_PRIVATE_UPSTREAMS` | `false` | Permit literal private/loopback upstream addresses |
+| `MCP_POOL_UPSTREAM_ALLOWED_HOSTS` | `[]` | Production JSON allowlist of exact upstream hosts |
+| `MCP_POOL_MAX_REQUEST_BODY_BYTES` | `2097152` | Maximum buffered downstream request body |
+| `MCP_POOL_REQUEST_LOG_RETENTION_DAYS` | `30` | SQLite audit-log retention on startup |
+| `MCP_POOL_SESSION_AFFINITY_TTL_SECONDS` | `86400` | In-process session binding lifetime |
+
+MCPPool remains a single-process, single-node SQLite deployment. Do not configure multiple Uvicorn
+workers: quota reservations, weighted routing cursors, and session affinity are process-local.
+Terminate TLS at a trusted reverse proxy, back up the database and application secret together,
+and see [SECURITY.md](SECURITY.md) for the deployment baseline.
 
 ## Initial roadmap
 
@@ -150,8 +194,9 @@ uv run pytest
 - [x] Context7 provider adapter
 - [x] Administration API and dashboard
 - [x] Gateway API-key authentication
-- [ ] Optional MCP session affinity
-- [ ] Metrics and retention controls
+- [x] Bounded in-process MCP session affinity
+- [x] Prometheus metrics and startup log retention
+- [ ] Durable multi-replica coordination
 
 ## Design principles
 
@@ -161,5 +206,6 @@ uv run pytest
 - Encrypt upstream credentials using `MCP_POOL_SECRET_KEY`; keep this value stable and backed up,
   because losing it makes stored credentials unreadable.
 - Return Gateway API keys only once and store only their HMAC digest.
+- Deny proxy access by default until a Gateway API key is configured.
 - Do not retry `tools/call` after an ambiguous upstream outcome.
 - Keep provider-specific behavior behind adapters instead of embedding it in the router.
