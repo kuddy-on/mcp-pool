@@ -79,31 +79,21 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    if hashed_password.startswith(f"{PASSWORD_HASH_SCHEME}$"):
-        try:
-            _, n, r, p, salt_hex, digest_hex = hashed_password.split("$", 5)
-            derived = hashlib.scrypt(
-                plain_password.encode("utf-8"),
-                salt=bytes.fromhex(salt_hex),
-                n=int(n),
-                r=int(r),
-                p=int(p),
-                dklen=len(bytes.fromhex(digest_hex)),
-            )
-        except (TypeError, ValueError):
-            return False
-        return hmac.compare_digest(derived.hex(), digest_hex)
-
-    # Compatibility path for databases created before the versioned scrypt format.
-    settings = get_settings()
-    legacy = hashlib.sha256(
-        f"{plain_password}:{settings.secret_key.get_secret_value()}".encode()
-    ).hexdigest()
-    return hmac.compare_digest(legacy, hashed_password)
-
-
-def password_hash_needs_upgrade(password_hash: str) -> bool:
-    return not password_hash.startswith(f"{PASSWORD_HASH_SCHEME}$")
+    if not hashed_password.startswith(f"{PASSWORD_HASH_SCHEME}$"):
+        return False
+    try:
+        _, n, r, p, salt_hex, digest_hex = hashed_password.split("$", 5)
+        derived = hashlib.scrypt(
+            plain_password.encode("utf-8"),
+            salt=bytes.fromhex(salt_hex),
+            n=int(n),
+            r=int(r),
+            p=int(p),
+            dklen=len(bytes.fromhex(digest_hex)),
+        )
+    except (TypeError, ValueError):
+        return False
+    return hmac.compare_digest(derived.hex(), digest_hex)
 
 
 def _jwt_signing_key() -> bytes:
