@@ -97,3 +97,16 @@ jobs:
           done
           docker logs mcp-pool-smoke
           exit 1
+      - name: Web smoke test
+        run: |
+          docker run -d --name mcp-pool-web-smoke \
+            -p 127.0.0.1:18080:8080 mcp-pool-web:test
+          trap 'docker rm -f mcp-pool-web-smoke >/dev/null 2>&1 || true' EXIT
+          for attempt in {1..20}; do
+            if curl --fail --silent http://127.0.0.1:18080/ >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs mcp-pool-web-smoke
+          exit 1
