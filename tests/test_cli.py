@@ -58,9 +58,9 @@ def test_reset_password_prompts_without_exposing_secret(monkeypatch: MonkeyPatch
     result = CliRunner().invoke(
         cli.app,
         ["reset-password", "admin"],
-        input="a-new-secure-password\na-new-secure-password\n",
+        input="short\nshort\n",
     )
 
     assert result.exit_code == 0
-    assert calls == [("admin", "a-new-secure-password")]
-    assert "a-new-secure-password" not in result.output
+    assert calls == [("admin", "short")]
+    assert "short" not in result.output

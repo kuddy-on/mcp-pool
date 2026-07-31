@@ -66,8 +66,8 @@ async def _reset_user_password(username: str, password: str) -> bool:
 def reset_password(username: Annotated[str, typer.Argument(help="Username to update.")]) -> None:
     """Replace a user's password with a versioned scrypt hash."""
     password = typer.prompt("New password", hide_input=True, confirmation_prompt=True)
-    if len(password) < 12:
-        raise typer.BadParameter("Password must contain at least 12 characters")
+    if not password:
+        raise typer.BadParameter("Password must not be empty")
     if not asyncio.run(_reset_user_password(username, password)):
         typer.echo(f"User '{username}' was not found", err=True)
         raise typer.Exit(code=1)
