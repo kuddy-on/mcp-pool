@@ -53,7 +53,7 @@ class LoginResponse(BaseModel):
 
 class UserCreateRequest(BaseModel):
     username: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
-    password: str = Field(min_length=12, max_length=1024)
+    password: str = Field(min_length=1, max_length=1024)
     role: Literal["admin", "user"] = "user"
 
 

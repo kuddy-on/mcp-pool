@@ -42,12 +42,6 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_production_secrets(self) -> "Settings":
-        if (
-            self.environment != "test"
-            and self.initial_admin_password is not None
-            and len(self.initial_admin_password.get_secret_value()) < 12
-        ):
-            raise ValueError("MCP_POOL_INITIAL_ADMIN_PASSWORD must contain at least 12 characters")
         if self.environment != "production":
             return self
         secret = self.secret_key.get_secret_value()
