@@ -29,6 +29,7 @@ export const AgentGuideCard: React.FC<AgentGuideCardProps> = ({
 
   return (
     <div
+      className="agent-guide"
       style={{
         backgroundColor: '#eef2ff',
         border: '1px solid #c7d2fe',
@@ -61,11 +62,12 @@ export const AgentGuideCard: React.FC<AgentGuideCardProps> = ({
       >
         {t.agentGuideDesc}
       </p>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+      <div className="agent-guide__endpoint" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
         <span style={{ fontSize: '12px', fontWeight: 600, color: '#312e81' }}>
           {t.gatewayUrlLabel}
         </span>
         <code
+          className="agent-guide__url"
           style={{
             backgroundColor: '#ffffff',
             padding: '4px 8px',

@@ -9,6 +9,7 @@ import {
   RefreshCw,
   XCircle,
 } from 'lucide-react';
+import { apiRequest } from '../../api/client';
 import type {
   AccountKey,
   ProviderQuotaKeyStatus,
@@ -16,12 +17,12 @@ import type {
   ServiceResponse,
 } from '../../types';
 import { Button } from '../common/Button';
-import { Modal } from '../common/Modal';
+import { AddKeyModal, EditKeyModal } from './KeyModals';
 
 export interface KeyTableProps {
   service: ServiceResponse;
   t: Record<string, string>;
-  authHeaders: () => HeadersInit;
+  token: string;
   fetchServices: () => void;
 }
 
@@ -40,19 +41,11 @@ const formatQuotaTime = (value: string | null): string => {
 export const KeyTable: React.FC<KeyTableProps> = ({
   service,
   t,
-  authHeaders,
+  token,
   fetchServices,
 }) => {
   const [showAddKeyModal, setShowAddKeyModal] = useState(false);
-  const [newKeyName, setNewKeyName] = useState('');
-  const [newSecretKey, setNewSecretKey] = useState('');
-  const [newKeyQuota, setNewKeyQuota] = useState('0');
-
   const [editingKey, setEditingKey] = useState<AccountKey | null>(null);
-  const [editKeyName, setEditKeyName] = useState('');
-  const [editKeySecret, setEditKeySecret] = useState('');
-  const [editKeyQuota, setEditKeyQuota] = useState('0');
-  const [editKeyUsedThisMonth, setEditKeyUsedThisMonth] = useState('0');
   const [providerQuota, setProviderQuota] = useState<ServiceQuotaStatusResponse | null>(null);
   const [quotaLoading, setQuotaLoading] = useState(false);
   const [refreshingQuotaKey, setRefreshingQuotaKey] = useState<string | null>(null);
@@ -65,7 +58,7 @@ export const KeyTable: React.FC<KeyTableProps> = ({
   const gridTemplateColumns = isContext7
     ? '1fr 1fr 0.75fr 1.55fr 1.2fr 0.65fr 1.25fr'
     : '1.2fr 1.2fr 0.8fr 1.5fr 0.8fr 1.2fr';
-  const tableMinWidth = isContext7 ? '980px' : '760px';
+  const tableMinWidth = isContext7 ? '840px' : '680px';
 
   const fetchProviderQuota = useCallback(
     async (showLoading = false, signal?: AbortSignal) => {
@@ -76,12 +69,13 @@ export const KeyTable: React.FC<KeyTableProps> = ({
       }
       if (showLoading) setQuotaLoading(true);
       try {
-        const res = await fetch(`/api/admin/services/${service.id}/quota-status`, {
-          headers: authHeaders(),
+        const data = await apiRequest<ServiceQuotaStatusResponse>(
+          `/api/admin/services/${service.id}/quota-status`,
+          token,
+          {
           signal,
-        });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = (await res.json()) as ServiceQuotaStatusResponse;
+          },
+        );
         if (!signal?.aborted && activeServiceIdRef.current === data.service_id) {
           setProviderQuota(data);
           setQuotaRequestError(false);
@@ -98,7 +92,7 @@ export const KeyTable: React.FC<KeyTableProps> = ({
         }
       }
     },
-    [authHeaders, isContext7, service.id]
+    [isContext7, service.id, token]
   );
 
   useEffect(() => {
@@ -129,15 +123,13 @@ export const KeyTable: React.FC<KeyTableProps> = ({
     setQuotaRequestError(false);
     try {
       const params = new URLSearchParams({ key_id: keyId });
-      const res = await fetch(
+      const data = await apiRequest<ServiceQuotaStatusResponse>(
         `/api/admin/services/${service.id}/quota-status/refresh?${params.toString()}`,
+        token,
         {
           method: 'POST',
-          headers: authHeaders(),
-        }
+        },
       );
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = (await res.json()) as ServiceQuotaStatusResponse;
       if (activeServiceIdRef.current === data.service_id) {
         setProviderQuota(data);
         fetchServices();
@@ -165,12 +157,11 @@ export const KeyTable: React.FC<KeyTableProps> = ({
     setRefreshingAllQuota(true);
     setQuotaRequestError(false);
     try {
-      const res = await fetch(`/api/admin/services/${service.id}/quota-status/refresh`, {
-        method: 'POST',
-        headers: authHeaders(),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = (await res.json()) as ServiceQuotaStatusResponse;
+      const data = await apiRequest<ServiceQuotaStatusResponse>(
+        `/api/admin/services/${service.id}/quota-status/refresh`,
+        token,
+        { method: 'POST' },
+      );
       if (activeServiceIdRef.current === data.service_id) {
         setProviderQuota(data);
         fetchServices();
@@ -338,68 +329,10 @@ export const KeyTable: React.FC<KeyTableProps> = ({
     );
   };
 
-  const handleAddKey = async () => {
-    if (!newSecretKey) return;
-    try {
-      const res = await fetch(`/api/admin/services/${service.id}/keys`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders() },
-        body: JSON.stringify({
-          name: newKeyName || 'API Key',
-          secret_key: newSecretKey,
-          monthly_quota: parseInt(newKeyQuota, 10) || 0,
-        }),
-      });
-      if (res.ok) {
-        setShowAddKeyModal(false);
-        setNewKeyName('');
-        setNewSecretKey('');
-        setNewKeyQuota('0');
-        fetchServices();
-      }
-    } catch (err) {
-      console.error('Failed to add key', err);
-    }
-  };
-
-  const openEditKey = (k: AccountKey) => {
-    setEditingKey(k);
-    setEditKeyName(k.name);
-    setEditKeySecret('');
-    setEditKeyQuota(String(k.monthly_quota || 0));
-    setEditKeyUsedThisMonth(String(k.used_this_month || 0));
-  };
-
-  const handleSaveEditKey = async () => {
-    if (!editingKey) return;
-    try {
-      const payload: Record<string, any> = {
-        name: editKeyName,
-        monthly_quota: parseInt(editKeyQuota, 10) || 0,
-        used_this_month: parseInt(editKeyUsedThisMonth, 10) || 0,
-      };
-      if (editKeySecret.trim()) {
-        payload.secret_key = editKeySecret.trim();
-      }
-      const res = await fetch(`/api/admin/services/${service.id}/keys/${editingKey.id}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...authHeaders() },
-        body: JSON.stringify(payload),
-      });
-      if (res.ok) {
-        setEditingKey(null);
-        fetchServices();
-      }
-    } catch (err) {
-      console.error('Failed to update key', err);
-    }
-  };
-
   const handleToggleKey = async (keyId: string, currentActive: boolean) => {
     try {
-      await fetch(`/api/admin/services/${service.id}/keys/${keyId}`, {
+      await apiRequest(`/api/admin/services/${service.id}/keys/${keyId}`, token, {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({ is_active: !currentActive }),
       });
       fetchServices();
@@ -410,9 +343,8 @@ export const KeyTable: React.FC<KeyTableProps> = ({
 
   const handleDeleteKey = async (keyId: string) => {
     try {
-      await fetch(`/api/admin/services/${service.id}/keys/${keyId}`, {
+      await apiRequest(`/api/admin/services/${service.id}/keys/${keyId}`, token, {
         method: 'DELETE',
-        headers: authHeaders(),
       });
       fetchServices();
     } catch (err) {
@@ -421,8 +353,9 @@ export const KeyTable: React.FC<KeyTableProps> = ({
   };
 
   return (
-    <div>
+    <div className="key-table">
       <div
+        className="key-table__toolbar"
         style={{
           display: 'flex',
           justifyContent: 'space-between',
@@ -441,6 +374,7 @@ export const KeyTable: React.FC<KeyTableProps> = ({
 
       {isContext7 && (
         <div
+          className="quota-hint"
           style={{
             display: 'flex',
             alignItems: 'flex-start',
@@ -494,6 +428,7 @@ export const KeyTable: React.FC<KeyTableProps> = ({
       )}
 
       <div
+        className="key-table__grid"
         style={{
           display: 'flex',
           flexDirection: 'column',
@@ -502,6 +437,7 @@ export const KeyTable: React.FC<KeyTableProps> = ({
         }}
       >
         <div
+          className="key-table__head"
           style={{
             display: 'grid',
             gridTemplateColumns,
@@ -529,6 +465,7 @@ export const KeyTable: React.FC<KeyTableProps> = ({
               : 0;
           return (
             <div
+              className="key-table__row"
               key={k.id}
               style={{
                 display: 'grid',
@@ -542,9 +479,9 @@ export const KeyTable: React.FC<KeyTableProps> = ({
                 backgroundColor: '#ffffff',
               }}
             >
-              <div style={{ fontWeight: 600, color: '#0f172a' }}>{k.name}</div>
-              <div style={{ fontFamily: 'monospace', color: '#475569' }}>{k.key_masked}</div>
-              <div>
+              <div className="key-cell key-cell--name" data-label={t.thName} style={{ fontWeight: 600, color: '#0f172a' }}>{k.name}</div>
+              <div className="key-cell" data-label={t.thKeyMask} style={{ fontFamily: 'monospace', color: '#475569' }}>{k.key_masked}</div>
+              <div className="key-cell" data-label={t.thStatus}>
                 {k.is_active && !k.quota_exhausted && (
                   <span
                     style={{
@@ -575,12 +512,13 @@ export const KeyTable: React.FC<KeyTableProps> = ({
                   <span style={{ color: '#d97706', fontWeight: 600 }}>{t.statusPaused}</span>
                 )}
               </div>
-              {isContext7 &&
-                renderProviderQuota(
+              {isContext7 && <div className="key-cell" data-label={t.thProviderQuota}>
+                {renderProviderQuota(
                   providerQuota?.keys.find((quota) => quota.key_id === k.id),
                   k.id
                 )}
-              <div>
+              </div>}
+              <div className="key-cell" data-label={t.thQuotaUsage}>
                 {k.monthly_quota > 0 ? (
                   <div>
                     <div
@@ -620,9 +558,9 @@ export const KeyTable: React.FC<KeyTableProps> = ({
                   </span>
                 )}
               </div>
-              <div style={{ color: '#0f172a' }}>{k.requests_count}</div>
-              <div style={{ display: 'flex', gap: '6px' }}>
-                <Button variant="small" onClick={() => openEditKey(k)}>
+              <div className="key-cell" data-label={t.thRequests} style={{ color: '#0f172a' }}>{k.requests_count}</div>
+              <div className="key-cell key-cell--actions" data-label={t.thActions} style={{ display: 'flex', gap: '6px' }}>
+                <Button variant="small" onClick={() => setEditingKey(k)}>
                   <Edit2 size={11} /> {t.actionEdit}
                 </Button>
                 <Button variant="small" onClick={() => handleToggleKey(k.id, k.is_active)}>
@@ -637,242 +575,8 @@ export const KeyTable: React.FC<KeyTableProps> = ({
         })}
       </div>
 
-      {/* Add Key Modal */}
-      <Modal
-        title={t.modalAddKeyTitle}
-        isOpen={showAddKeyModal}
-        onClose={() => setShowAddKeyModal(false)}
-      >
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-          <div>
-            <label
-              style={{
-                fontSize: '12px',
-                fontWeight: 600,
-                color: '#475569',
-                display: 'block',
-                marginBottom: '4px',
-              }}
-            >
-              {t.labelKeyName}
-            </label>
-            <input
-              style={{
-                width: '100%',
-                padding: '8px 10px',
-                borderRadius: '6px',
-                border: '1px solid #cbd5e1',
-                fontSize: '13px',
-                boxSizing: 'border-box',
-              }}
-              value={newKeyName}
-              onChange={(e) => setNewKeyName(e.target.value)}
-              placeholder={t.phKeyName}
-            />
-          </div>
-          <div>
-            <label
-              style={{
-                fontSize: '12px',
-                fontWeight: 600,
-                color: '#475569',
-                display: 'block',
-                marginBottom: '4px',
-              }}
-            >
-              {t.labelSecretKey}
-            </label>
-            <input
-              type="password"
-              style={{
-                width: '100%',
-                padding: '8px 10px',
-                borderRadius: '6px',
-                border: '1px solid #cbd5e1',
-                fontSize: '13px',
-                boxSizing: 'border-box',
-              }}
-              value={newSecretKey}
-              onChange={(e) => setNewSecretKey(e.target.value)}
-              placeholder={t.phSecretKey}
-            />
-          </div>
-          <div>
-            <label
-              style={{
-                fontSize: '12px',
-                fontWeight: 600,
-                color: '#475569',
-                display: 'block',
-                marginBottom: '4px',
-              }}
-            >
-              {t.labelMonthlyQuota}
-            </label>
-            <input
-              type="number"
-              min="0"
-              style={{
-                width: '100%',
-                padding: '8px 10px',
-                borderRadius: '6px',
-                border: '1px solid #cbd5e1',
-                fontSize: '13px',
-                boxSizing: 'border-box',
-              }}
-              value={newKeyQuota}
-              onChange={(e) => setNewKeyQuota(e.target.value)}
-              placeholder={t.phMonthlyQuota}
-            />
-          </div>
-          <div
-            style={{
-              display: 'flex',
-              justifyContent: 'flex-end',
-              gap: '8px',
-              marginTop: '8px',
-            }}
-          >
-            <Button variant="secondary" onClick={() => setShowAddKeyModal(false)}>
-              {t.btnCancel}
-            </Button>
-            <Button variant="primary" onClick={handleAddKey}>
-              {t.btnAddKey}
-            </Button>
-          </div>
-        </div>
-      </Modal>
-
-      {/* Edit Key Modal */}
-      <Modal
-        title={t.modalEditKeyTitle}
-        isOpen={Boolean(editingKey)}
-        onClose={() => setEditingKey(null)}
-      >
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-          <div>
-            <label
-              style={{
-                fontSize: '12px',
-                fontWeight: 600,
-                color: '#475569',
-                display: 'block',
-                marginBottom: '4px',
-              }}
-            >
-              {t.labelKeyName}
-            </label>
-            <input
-              style={{
-                width: '100%',
-                padding: '8px 10px',
-                borderRadius: '6px',
-                border: '1px solid #cbd5e1',
-                fontSize: '13px',
-                boxSizing: 'border-box',
-              }}
-              value={editKeyName}
-              onChange={(e) => setEditKeyName(e.target.value)}
-            />
-          </div>
-          <div>
-            <label
-              style={{
-                fontSize: '12px',
-                fontWeight: 600,
-                color: '#475569',
-                display: 'block',
-                marginBottom: '4px',
-              }}
-            >
-              {t.labelSecretKey} (留空不修改)
-            </label>
-            <input
-              type="password"
-              style={{
-                width: '100%',
-                padding: '8px 10px',
-                borderRadius: '6px',
-                border: '1px solid #cbd5e1',
-                fontSize: '13px',
-                boxSizing: 'border-box',
-              }}
-              value={editKeySecret}
-              onChange={(e) => setEditKeySecret(e.target.value)}
-              placeholder="••••••••"
-            />
-          </div>
-          <div>
-            <label
-              style={{
-                fontSize: '12px',
-                fontWeight: 600,
-                color: '#475569',
-                display: 'block',
-                marginBottom: '4px',
-              }}
-            >
-              {t.labelMonthlyQuota}
-            </label>
-            <input
-              type="number"
-              min="0"
-              style={{
-                width: '100%',
-                padding: '8px 10px',
-                borderRadius: '6px',
-                border: '1px solid #cbd5e1',
-                fontSize: '13px',
-                boxSizing: 'border-box',
-              }}
-              value={editKeyQuota}
-              onChange={(e) => setEditKeyQuota(e.target.value)}
-            />
-          </div>
-          <div>
-            <label
-              style={{
-                fontSize: '12px',
-                fontWeight: 600,
-                color: '#475569',
-                display: 'block',
-                marginBottom: '4px',
-              }}
-            >
-              {t.labelUsedThisMonth}
-            </label>
-            <input
-              type="number"
-              min="0"
-              style={{
-                width: '100%',
-                padding: '8px 10px',
-                borderRadius: '6px',
-                border: '1px solid #cbd5e1',
-                fontSize: '13px',
-                boxSizing: 'border-box',
-              }}
-              value={editKeyUsedThisMonth}
-              onChange={(e) => setEditKeyUsedThisMonth(e.target.value)}
-            />
-          </div>
-          <div
-            style={{
-              display: 'flex',
-              justifyContent: 'flex-end',
-              gap: '8px',
-              marginTop: '8px',
-            }}
-          >
-            <Button variant="secondary" onClick={() => setEditingKey(null)}>
-              {t.btnCancel}
-            </Button>
-            <Button variant="primary" onClick={handleSaveEditKey}>
-              {t.btnSaveService}
-            </Button>
-          </div>
-        </div>
-      </Modal>
+      <AddKeyModal serviceId={service.id} open={showAddKeyModal} onClose={() => setShowAddKeyModal(false)} t={t} token={token} onSaved={fetchServices} />
+      <EditKeyModal serviceId={service.id} item={editingKey} onClose={() => setEditingKey(null)} t={t} token={token} onSaved={fetchServices} />
     </div>
   );
 };

@@ -1,7 +1,7 @@
 import React from 'react';
 
 export interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
-  variant?: 'primary' | 'secondary' | 'danger' | 'small' | 'danger-small';
+  variant?: 'primary' | 'secondary' | 'ghost' | 'danger' | 'small' | 'danger-small';
   children: React.ReactNode;
 }
 
@@ -40,6 +40,11 @@ export const Button: React.FC<ButtonProps> = ({
       border: '1px solid #cbd5e1',
       padding: '7px 12px',
     },
+    ghost: {
+      backgroundColor: 'transparent',
+      color: '#475569',
+      padding: '9px 12px',
+    },
     danger: {
       backgroundColor: '#ef4444',
       color: '#ffffff',
@@ -63,6 +68,7 @@ export const Button: React.FC<ButtonProps> = ({
 
   return (
     <button
+      className={`button button--${variant}`}
       style={{
         ...baseStyle,
         ...variantStyles[variant],

@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { apiRequest } from '../../api/client';
 import { Modal } from '../common/Modal';
 import { Button } from '../common/Button';
 import { CustomSelect } from '../common/CustomSelect';
@@ -7,7 +8,7 @@ export interface AddServiceModalProps {
   isOpen: boolean;
   onClose: () => void;
   t: Record<string, string>;
-  authHeaders: () => HeadersInit;
+  token: string;
   fetchServices: () => void;
 }
 
@@ -15,7 +16,7 @@ export const AddServiceModal: React.FC<AddServiceModalProps> = ({
   isOpen,
   onClose,
   t,
-  authHeaders,
+  token,
   fetchServices,
 }) => {
   const [newServiceName, setNewServiceName] = useState('');
@@ -30,21 +31,18 @@ export const AddServiceModal: React.FC<AddServiceModalProps> = ({
   const handleCreateService = async () => {
     if (!newServiceName || !newServiceUrl) return;
     try {
-      const res = await fetch('/api/admin/services', {
+      await apiRequest('/api/admin/services', token, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({
           name: newServiceName,
           upstream_url: newServiceUrl,
           provider_type: newServiceProvider,
         }),
       });
-      if (res.ok) {
-        onClose();
-        setNewServiceName('');
-        setNewServiceUrl('');
-        fetchServices();
-      }
+      onClose();
+      setNewServiceName('');
+      setNewServiceUrl('');
+      fetchServices();
     } catch (err) {
       console.error('Failed to create service', err);
     }
