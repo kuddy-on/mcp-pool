@@ -14,12 +14,14 @@ RUN uv sync --frozen --no-dev --no-install-project
 COPY src ./src
 RUN uv sync --frozen --no-dev
 
-ENV PATH="/app/.venv/bin:$PATH"
+ENV PATH="/app/.venv/bin:$PATH" \
+    MCP_POOL_DATABASE_URL="sqlite+aiosqlite:////app/data/mcp_pool.db"
 
 RUN groupadd --system mcp-pool \
     && useradd --system --gid mcp-pool --home-dir /app mcp-pool \
     && mkdir -p /app/data \
-    && chown -R mcp-pool:mcp-pool /app/data
+    && chown -R mcp-pool:mcp-pool /app/data \
+    && chmod -R a+rX /app/src
 
 USER mcp-pool
 
