@@ -82,31 +82,26 @@ jobs:
           tags: mcp-pool-web:test
           cache-from: type=gha,scope=web
           cache-to: type=gha,mode=max,scope=web
-      - name: Gateway smoke test
+      - name: Container smoke tests
         run: |
-          docker run -d --name mcp-pool-smoke \
+          docker network create mcp-pool-smoke-network
+          docker run -d --name mcp-pool-smoke-gateway \
+            --network mcp-pool-smoke-network \
+            --network-alias gateway \
             -e MCP_POOL_ENVIRONMENT=test \
             -e MCP_POOL_SECRET_KEY=ci-only-secret \
             -p 127.0.0.1:18000:8000 mcp-pool:test
-          trap 'docker rm -f mcp-pool-smoke >/dev/null 2>&1 || true' EXIT
-          for attempt in {1..20}; do
-            if curl --fail --silent http://127.0.0.1:18000/health/ready; then
-              exit 0
-            fi
-            sleep 1
-          done
-          docker logs mcp-pool-smoke
-          exit 1
-      - name: Web smoke test
-        run: |
-          docker run -d --name mcp-pool-web-smoke \
+          docker run -d --name mcp-pool-smoke-web \
+            --network mcp-pool-smoke-network \
             -p 127.0.0.1:18080:8080 mcp-pool-web:test
-          trap 'docker rm -f mcp-pool-web-smoke >/dev/null 2>&1 || true' EXIT
+          trap 'docker rm -f mcp-pool-smoke-web mcp-pool-smoke-gateway >/dev/null 2>&1 || true; docker network rm mcp-pool-smoke-network >/dev/null 2>&1 || true' EXIT
           for attempt in {1..20}; do
-            if curl --fail --silent http://127.0.0.1:18080/ >/dev/null; then
+            if curl --fail --silent http://127.0.0.1:18000/health/ready >/dev/null \
+              && curl --fail --silent http://127.0.0.1:18080/ >/dev/null; then
               exit 0
             fi
             sleep 1
           done
-          docker logs mcp-pool-web-smoke
+          docker logs mcp-pool-smoke-gateway
+          docker logs mcp-pool-smoke-web
           exit 1
