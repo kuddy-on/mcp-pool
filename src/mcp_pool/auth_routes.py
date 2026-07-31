@@ -1,6 +1,10 @@
+import asyncio
+import math
+import time
+from collections import OrderedDict
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
 
 from mcp_pool.auth import (
@@ -11,26 +15,106 @@ from mcp_pool.auth import (
     create_access_token,
     get_current_user,
     hash_password,
+    password_hash_needs_upgrade,
     require_admin,
     verify_password,
 )
+from mcp_pool.config import get_settings
 from mcp_pool.db import UserModel, async_session
 
 router = APIRouter(prefix="/api", tags=["auth"])
+_login_failures: OrderedDict[str, list[float]] = OrderedDict()
+_login_failures_lock = asyncio.Lock()
+
+
+def _login_client_id(request: Request, username: str) -> str:
+    settings = get_settings()
+    forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    address = (
+        forwarded
+        if settings.trust_proxy_headers and forwarded
+        else request.client.host
+        if request.client
+        else "unknown"
+    )
+    return f"{address}:{username.casefold()}"
+
+
+async def _login_retry_after(client_id: str) -> int:
+    settings = get_settings()
+    now = time.monotonic()
+    cutoff = now - settings.login_attempt_window_seconds
+    async with _login_failures_lock:
+        attempts = [attempt for attempt in _login_failures.get(client_id, []) if attempt >= cutoff]
+        if attempts:
+            _login_failures[client_id] = attempts
+            _login_failures.move_to_end(client_id)
+        else:
+            _login_failures.pop(client_id, None)
+        if len(attempts) < settings.login_attempt_limit:
+            return 0
+        return max(1, math.ceil(settings.login_attempt_window_seconds - (now - attempts[0])))
+
+
+async def _record_login_failure(client_id: str) -> int:
+    settings = get_settings()
+    now = time.monotonic()
+    async with _login_failures_lock:
+        if (
+            client_id not in _login_failures
+            and len(_login_failures) >= settings.login_attempt_max_entries
+        ):
+            cutoff = now - settings.login_attempt_window_seconds
+            expired = [
+                known_id
+                for known_id, attempts in _login_failures.items()
+                if not attempts or attempts[-1] < cutoff
+            ]
+            for known_id in expired:
+                _login_failures.pop(known_id, None)
+            while len(_login_failures) >= settings.login_attempt_max_entries:
+                _login_failures.popitem(last=False)
+        _login_failures.setdefault(client_id, []).append(now)
+        _login_failures.move_to_end(client_id)
+    return await _login_retry_after(client_id)
+
+
+async def _clear_login_failures(client_id: str) -> None:
+    async with _login_failures_lock:
+        _login_failures.pop(client_id, None)
 
 
 @router.post("/auth/login", response_model=LoginResponse)
-async def login(req: LoginRequest) -> LoginResponse:
+async def login(req: LoginRequest, request: Request) -> LoginResponse:
+    client_id = _login_client_id(request, req.username)
+    retry_after = await _login_retry_after(client_id)
+    if retry_after:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many login attempts",
+            headers={"Retry-After": str(retry_after)},
+        )
     async with async_session() as session:
         stmt = select(UserModel).where(UserModel.username == req.username)
         res = await session.execute(stmt)
         user = res.scalar_one_or_none()
 
         if not user or not verify_password(req.password, user.password_hash):
+            retry_after = await _record_login_failure(client_id)
+            if retry_after:
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail="Too many login attempts",
+                    headers={"Retry-After": str(retry_after)},
+                )
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Incorrect username or password",
             )
+        if password_hash_needs_upgrade(user.password_hash):
+            user.password_hash = hash_password(req.password)
+            await session.commit()
+        await _clear_login_failures(client_id)
 
         user_dto = UserDTO(id=user.id, username=user.username, role=user.role)
         token = create_access_token(
@@ -81,7 +165,7 @@ async def create_user(
         new_usr = UserModel(
             username=req.username,
             password_hash=hash_password(req.password),
-            role=req.role if req.role in ("admin", "user") else "user",
+            role=req.role,
         )
         session.add(new_usr)
         await session.commit()

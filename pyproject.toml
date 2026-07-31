@@ -4,11 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-pool"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Multi-account pooling and quota-aware routing gateway for MCP services"
 readme = "README.md"
 requires-python = ">=3.12"
 authors = [{ name = "kuddy-on" }]
+license = "MIT"
+keywords = ["mcp", "gateway", "proxy", "quota", "model-context-protocol"]
 classifiers = [
   "Development Status :: 2 - Pre-Alpha",
   "Framework :: FastAPI",
@@ -18,7 +20,7 @@ classifiers = [
 ]
 dependencies = [
   "aiosqlite>=0.20,<1",
-  "cryptography>=44,<47",
+  "cryptography>=48.0.1,<49",
   "fastapi>=0.115,<1",
   "httpx[http2]>=0.28,<1",
   "prometheus-client>=0.21,<1",
@@ -30,6 +32,12 @@ dependencies = [
   "uvicorn[standard]>=0.34,<1",
 ]
 
+[project.urls]
+Homepage = "https://github.com/kuddy-on/mcp-pool"
+Documentation = "https://github.com/kuddy-on/mcp-pool#readme"
+Issues = "https://github.com/kuddy-on/mcp-pool/issues"
+Source = "https://github.com/kuddy-on/mcp-pool"
+
 [project.scripts]
 mcp-pool = "mcp_pool.cli:app"
 
@@ -38,11 +46,15 @@ dev = [
   "mypy>=1.14,<2",
   "pytest>=8.3,<9",
   "pytest-asyncio>=0.25,<1",
+  "pytest-cov>=6,<8",
   "ruff>=0.9,<1",
 ]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mcp_pool"]
+
+[tool.hatch.version]
+path = "src/mcp_pool/__init__.py"
 
 [tool.uv]
 default-groups = ["dev"]

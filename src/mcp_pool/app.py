@@ -1,20 +1,24 @@
+import asyncio
 import json
 import math
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from types import TracebackType
 from uuid import uuid4
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
+from sqlalchemy import text
 
 from mcp_pool import __version__, admin_routes
 from mcp_pool.admin_routes import router as admin_router
 from mcp_pool.auth_routes import router as auth_router
 from mcp_pool.config import get_settings
-from mcp_pool.db import init_db
+from mcp_pool.db import engine, init_db
 from mcp_pool.domain.admin import RequestLogItem
 from mcp_pool.pool import KeyPoolManager, KeyPoolRegistry
 from mcp_pool.providers.base import ProviderSignalKind
@@ -22,6 +26,65 @@ from mcp_pool.providers.context7 import Context7ProviderAdapter
 
 pool_registry: KeyPoolRegistry | None = None
 http_client: httpx.AsyncClient | None = None
+
+PROXY_REQUESTS = Counter(
+    "mcp_pool_proxy_requests_total",
+    "Observed upstream proxy responses.",
+    ("service", "status", "signal"),
+)
+PROXY_DURATION = Histogram(
+    "mcp_pool_proxy_duration_seconds",
+    "End-to-end proxy request duration.",
+    ("service",),
+)
+PROXY_STREAM_COMPLETIONS = Counter(
+    "mcp_pool_proxy_stream_completions_total",
+    "Downstream stream completion outcomes.",
+    ("service", "outcome"),
+)
+
+
+class AttemptResources:
+    """Own one quota reservation and any response not handed to the streamer."""
+
+    def __init__(self, registry: KeyPoolRegistry, key_id: str):
+        self._registry = registry
+        self._key_id = key_id
+        self._response: httpx.Response | None = None
+        self._response_transferred = False
+
+    async def __aenter__(self) -> "AttemptResources":
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        async def cleanup() -> None:
+            try:
+                if self._response is not None and not self._response_transferred:
+                    await self._response.aclose()
+            finally:
+                await self._registry.release_key_reservation(self._key_id)
+
+        cleanup_task = asyncio.create_task(cleanup())
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            await cleanup_task
+            raise
+
+    def own_response(self, response: httpx.Response) -> None:
+        self._response = response
+
+    def transfer_response(self) -> httpx.Response:
+        if self._response is None:
+            raise RuntimeError("No upstream response is available")
+        self._response_transferred = True
+        return self._response
+
 
 HTTP_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"]
 SAFE_HTTP_METHODS = {"GET", "HEAD", "OPTIONS"}
@@ -53,12 +116,25 @@ HOP_BY_HOP_HEADERS = {
 }
 
 
-async def _stream_response(response: httpx.Response) -> AsyncIterator[bytes]:
+async def _stream_response(
+    response: httpx.Response,
+    service_name: str,
+    start_time: float,
+) -> AsyncIterator[bytes]:
+    outcome = "completed"
     try:
         async for chunk in response.aiter_bytes():
             yield chunk
+    except asyncio.CancelledError:
+        outcome = "cancelled"
+        raise
+    except Exception:
+        outcome = "error"
+        raise
     finally:
         await response.aclose()
+        PROXY_DURATION.labels(service=service_name).observe(time.perf_counter() - start_time)
+        PROXY_STREAM_COMPLETIONS.labels(service=service_name, outcome=outcome).inc()
 
 
 def extract_mcp_method(body_bytes: bytes) -> str | None:
@@ -158,7 +234,9 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     pool_registry = KeyPoolRegistry(settings.services)
     await pool_registry.initialize()
     admin_routes.registry = pool_registry
-    http_client = httpx.AsyncClient(timeout=60.0)
+    http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0)
+    )
     yield
     if http_client:
         await http_client.aclose()
@@ -172,15 +250,35 @@ async def proxy_request(
     client: httpx.AsyncClient,
     client_key_name: str,
 ) -> Response:
+    settings = get_settings()
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > settings.max_request_body_bytes:
+                raise HTTPException(status_code=413, detail="Request body is too large")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length header") from exc
     body = await request.body()
+    if len(body) > settings.max_request_body_bytes:
+        raise HTTPException(status_code=413, detail="Request body is too large")
     mcp_method = extract_mcp_method(body)
-    monthly_usage = await registry.get_monthly_usage()
     attempted_key_ids: set[str] = set()
     failover_chain: list[str] = []
     rate_limited_until: list[datetime] = []
     start_time = time.perf_counter()
-    client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (
-        request.client.host if request.client else None
+    forwarded_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    client_ip = (
+        forwarded_ip
+        if settings.trust_proxy_headers and forwarded_ip
+        else request.client.host
+        if request.client
+        else None
+    )
+    request_session_id = request.headers.get("mcp-session-id")
+    affinity_key_id = (
+        await registry.get_session_key_id(request_session_id, manager.service_id)
+        if request_session_id
+        else None
     )
 
     async def add_request_log(
@@ -210,110 +308,145 @@ async def proxy_request(
             )
         )
 
-    for _ in range(len(manager.keys) or 1):
-        key = manager.get_current_key(monthly_usage, attempted_key_ids)
+    attempts = 1 if affinity_key_id is not None else len(manager.keys) or 1
+    for _ in range(attempts):
+        key = await registry.reserve_key(
+            manager,
+            attempted_key_ids,
+            preferred_key_id=affinity_key_id,
+        )
         if key is None:
             break
         attempted_key_ids.add(key.key_id)
 
-        credential = key.secret_key
-        headers = manager.provider_adapter.prepare_headers(
-            credential,
-            httpx.Headers(request.headers),
-        )
-        headers.pop("x-mcp-service", None)
-        upstream_request = client.build_request(
-            method=request.method,
-            url=build_upstream_url(manager, path, request.url.query),
-            headers=headers,
-            content=body,
-        )
-
-        try:
-            upstream_response = await client.send(upstream_request, stream=True)
-        except httpx.RequestError as exc:
-            await registry.record_signal(
-                manager,
-                key.key_id,
-                ProviderSignalKind.UPSTREAM_UNHEALTHY,
+        async with AttemptResources(registry, key.key_id) as resources:
+            credential = key.secret_key
+            headers = manager.provider_adapter.prepare_headers(
+                credential,
+                httpx.Headers(request.headers),
             )
-            failover_chain.append(f"{key.name}:unhealthy")
-            if is_ambiguous_retry_safe(request.method, mcp_method):
-                continue
-            await add_request_log(
-                key.key_id,
-                key.name,
-                502,
-                ProviderSignalKind.UPSTREAM_UNHEALTHY,
+            headers.pop("x-mcp-service", None)
+            headers["x-request-id"] = request.state.request_id
+            upstream_request = client.build_request(
+                method=request.method,
+                url=build_upstream_url(manager, path, request.url.query),
+                headers=headers,
+                content=body,
             )
-            raise HTTPException(
-                status_code=502,
-                detail="Upstream connection failed; request was not retried because "
-                "the operation may be non-idempotent",
-            ) from exc
 
-        response_observed_at = datetime.now(UTC)
-        signal = await manager.provider_adapter.classify_response(upstream_response)
-        failover_chain.append(f"{key.name}:{signal.kind.value}")
-        request_log_recorded = False
-        if isinstance(manager.provider_adapter, Context7ProviderAdapter):
-            async with registry.provider_quota_state_lock(key.key_id):
-                if key.secret_key == credential:
-                    manager.provider_adapter.capture_quota_response(
-                        key,
-                        upstream_response,
-                        expected_credential=credential,
-                        estimate_success_without_headers=(
-                            signal.kind == ProviderSignalKind.SUCCESS
-                            and is_context7_quota_usage_request(mcp_method)
-                        ),
-                        observed_at=response_observed_at,
-                    )
-                    await registry.record_signal(
-                        manager,
-                        key.key_id,
-                        signal.kind,
-                        signal.retry_at,
-                    )
-                    if signal.kind == ProviderSignalKind.SUCCESS:
-                        await add_request_log(
-                            key.key_id,
-                            key.name,
-                            upstream_response.status_code,
-                            signal.kind,
+            try:
+                upstream_response = await client.send(upstream_request, stream=True)
+            except httpx.RequestError as exc:
+                await registry.record_signal(
+                    manager,
+                    key.key_id,
+                    ProviderSignalKind.UPSTREAM_UNHEALTHY,
+                )
+                failover_chain.append(f"{key.name}:unhealthy")
+                if is_ambiguous_retry_safe(request.method, mcp_method):
+                    continue
+                await add_request_log(
+                    key.key_id,
+                    key.name,
+                    502,
+                    ProviderSignalKind.UPSTREAM_UNHEALTHY,
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail="Upstream connection failed; request was not retried because "
+                    "the operation may be non-idempotent",
+                ) from exc
+
+            resources.own_response(upstream_response)
+            response_observed_at = datetime.now(UTC)
+            try:
+                signal = await manager.provider_adapter.classify_response(upstream_response)
+            except Exception as exc:
+                raise HTTPException(status_code=502, detail="Invalid upstream response") from exc
+            PROXY_REQUESTS.labels(
+                service=manager.service_name,
+                status=str(upstream_response.status_code),
+                signal=signal.kind.value,
+            ).inc()
+            failover_chain.append(f"{key.name}:{signal.kind.value}")
+            request_log_recorded = False
+            if isinstance(manager.provider_adapter, Context7ProviderAdapter):
+                async with registry.provider_quota_state_lock(key.key_id):
+                    if key.secret_key == credential:
+                        manager.provider_adapter.capture_quota_response(
+                            key,
+                            upstream_response,
+                            expected_credential=credential,
+                            estimate_success_without_headers=(
+                                signal.kind == ProviderSignalKind.SUCCESS
+                                and is_context7_quota_usage_request(mcp_method)
+                            ),
+                            observed_at=response_observed_at,
                         )
-                        request_log_recorded = True
-        elif key.secret_key == credential:
-            await registry.record_signal(
-                manager,
-                key.key_id,
-                signal.kind,
-                signal.retry_at,
-            )
-        if signal.kind in DEFINITIVE_REJECTION_SIGNALS:
-            if signal.kind == ProviderSignalKind.RATE_LIMITED and signal.retry_at:
-                rate_limited_until.append(signal.retry_at)
-            await upstream_response.aclose()
-            continue
+                        await registry.record_signal(
+                            manager,
+                            key.key_id,
+                            signal.kind,
+                            signal.retry_at,
+                        )
+                        if signal.kind == ProviderSignalKind.SUCCESS:
+                            await add_request_log(
+                                key.key_id,
+                                key.name,
+                                upstream_response.status_code,
+                                signal.kind,
+                            )
+                            request_log_recorded = True
+            elif key.secret_key == credential:
+                await registry.record_signal(
+                    manager,
+                    key.key_id,
+                    signal.kind,
+                    signal.retry_at,
+                )
+            if signal.kind in DEFINITIVE_REJECTION_SIGNALS:
+                if signal.kind == ProviderSignalKind.RATE_LIMITED and signal.retry_at:
+                    rate_limited_until.append(signal.retry_at)
+                continue
 
-        if signal.kind == ProviderSignalKind.UPSTREAM_UNHEALTHY and is_ambiguous_retry_safe(
-            request.method, mcp_method
-        ):
-            await upstream_response.aclose()
-            continue
+            if signal.kind == ProviderSignalKind.UPSTREAM_UNHEALTHY and is_ambiguous_retry_safe(
+                request.method, mcp_method
+            ):
+                continue
 
-        if not request_log_recorded:
-            await add_request_log(
-                key.key_id,
-                key.name,
-                upstream_response.status_code,
-                signal.kind,
+            if not request_log_recorded:
+                await add_request_log(
+                    key.key_id,
+                    key.name,
+                    upstream_response.status_code,
+                    signal.kind,
+                )
+            response_session_id = upstream_response.headers.get("mcp-session-id")
+            if signal.kind == ProviderSignalKind.SUCCESS:
+                if response_session_id:
+                    await registry.bind_session(
+                        response_session_id,
+                        manager.service_id,
+                        key.key_id,
+                    )
+                elif request_session_id and affinity_key_id is None:
+                    await registry.bind_session(
+                        request_session_id,
+                        manager.service_id,
+                        key.key_id,
+                    )
+                if request.method == "DELETE" and request_session_id:
+                    await registry.unbind_session(request_session_id, manager.service_id)
+            streaming_response = resources.transfer_response()
+            return StreamingResponse(
+                content=_stream_response(
+                    streaming_response,
+                    manager.service_name,
+                    start_time,
+                ),
+                status_code=streaming_response.status_code,
+                headers=response_headers(streaming_response),
             )
-        return StreamingResponse(
-            content=_stream_response(upstream_response),
-            status_code=upstream_response.status_code,
-            headers=response_headers(upstream_response),
-        )
 
     if rate_limited_until:
         retry_at = min(rate_limited_until)
@@ -342,11 +475,24 @@ def create_app() -> FastAPI:
         version=__version__,
         description="Multi-account pooling and quota-aware routing gateway for MCP services.",
         lifespan=lifespan,
+        docs_url=None if settings.environment == "production" else "/docs",
+        redoc_url=None if settings.environment == "production" else "/redoc",
+        openapi_url=None if settings.environment == "production" else "/openapi.json",
     )
 
     # Mount auth and admin API routes under /api
     app.include_router(auth_router)
     app.include_router(admin_router)
+
+    @app.middleware("http")
+    async def request_id_header(
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
+        request.state.request_id = str(uuid4())
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request.state.request_id
+        return response
 
     @app.get("/health/live", tags=["health"])
     async def liveness() -> dict[str, str]:
@@ -354,7 +500,16 @@ def create_app() -> FastAPI:
 
     @app.get("/health/ready", tags=["health"])
     async def readiness() -> dict[str, str]:
+        try:
+            async with engine.connect() as connection:
+                await connection.execute(text("SELECT 1"))
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail="Database is not ready") from exc
         return {"status": "ready", "environment": settings.environment}
+
+    @app.get("/metrics", include_in_schema=False)
+    async def metrics() -> Response:
+        return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
     @app.api_route("/s/{service_name}/{path:path}", methods=HTTP_METHODS)
     async def proxy_mcp_by_service(request: Request, service_name: str, path: str) -> Response:

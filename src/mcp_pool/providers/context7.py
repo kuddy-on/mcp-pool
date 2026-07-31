@@ -11,6 +11,7 @@ from mcp_pool.providers.base import (
     ProviderSignal,
     ProviderSignalKind,
     parse_retry_after,
+    sanitize_request_headers,
 )
 
 if TYPE_CHECKING:
@@ -29,9 +30,7 @@ class Context7ProviderAdapter(ProviderAdapter):
 
     def prepare_headers(self, credential: str, headers: httpx.Headers) -> httpx.Headers:
         """Inject Authorization header with Bearer API Key into upstream request."""
-        new_headers = httpx.Headers(headers)
-        new_headers.pop("host", None)
-        new_headers.pop("content-length", None)
+        new_headers = sanitize_request_headers(headers)
 
         token = credential if credential.startswith("Bearer ") else f"Bearer {credential}"
         new_headers["authorization"] = token
@@ -235,6 +234,7 @@ class Context7ProviderAdapter(ProviderAdapter):
                 update={"local_usage_events": pending_events}
             ).model_dump_json()
             key.provider_quota_error = None
+            key.quota_exhausted = max(0, result.remaining - len(pending_events)) == 0
         else:
             previous_error = _load_error(key.provider_quota_error)
             previous_snapshot = _load_snapshot(key.provider_quota_snapshot)

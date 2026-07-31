@@ -1,13 +1,14 @@
 import hashlib
 import hmac
+import secrets
 from datetime import UTC, datetime, timedelta
-from typing import Annotated
+from typing import Annotated, Literal
 
 import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jwt.exceptions import ExpiredSignatureError, InvalidTokenError
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import select
 
 from mcp_pool.config import get_settings
@@ -27,6 +28,10 @@ REQUIRED_JWT_CLAIMS = [
     "role",
     "token_version",
 ]
+PASSWORD_HASH_SCHEME = "scrypt"
+PASSWORD_SCRYPT_N = 2**14
+PASSWORD_SCRYPT_R = 8
+PASSWORD_SCRYPT_P = 1
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
@@ -37,8 +42,8 @@ class UserDTO(BaseModel):
 
 
 class LoginRequest(BaseModel):
-    username: str
-    password: str
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=1024)
 
 
 class LoginResponse(BaseModel):
@@ -47,9 +52,9 @@ class LoginResponse(BaseModel):
 
 
 class UserCreateRequest(BaseModel):
-    username: str
-    password: str
-    role: str = "user"
+    username: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
+    password: str = Field(min_length=12, max_length=1024)
+    role: Literal["admin", "user"] = "user"
 
 
 class AccessTokenClaims(UserDTO):
@@ -57,13 +62,48 @@ class AccessTokenClaims(UserDTO):
 
 
 def hash_password(password: str) -> str:
-    settings = get_settings()
-    salted = f"{password}:{settings.secret_key.get_secret_value()}"
-    return hashlib.sha256(salted.encode("utf-8")).hexdigest()
+    """Hash a password with a memory-hard, independently salted KDF."""
+    salt = secrets.token_bytes(16)
+    derived = hashlib.scrypt(
+        password.encode("utf-8"),
+        salt=salt,
+        n=PASSWORD_SCRYPT_N,
+        r=PASSWORD_SCRYPT_R,
+        p=PASSWORD_SCRYPT_P,
+        dklen=32,
+    )
+    return (
+        f"{PASSWORD_HASH_SCHEME}${PASSWORD_SCRYPT_N}${PASSWORD_SCRYPT_R}$"
+        f"{PASSWORD_SCRYPT_P}${salt.hex()}${derived.hex()}"
+    )
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return hmac.compare_digest(hash_password(plain_password), hashed_password)
+    if hashed_password.startswith(f"{PASSWORD_HASH_SCHEME}$"):
+        try:
+            _, n, r, p, salt_hex, digest_hex = hashed_password.split("$", 5)
+            derived = hashlib.scrypt(
+                plain_password.encode("utf-8"),
+                salt=bytes.fromhex(salt_hex),
+                n=int(n),
+                r=int(r),
+                p=int(p),
+                dklen=len(bytes.fromhex(digest_hex)),
+            )
+        except (TypeError, ValueError):
+            return False
+        return hmac.compare_digest(derived.hex(), digest_hex)
+
+    # Compatibility path for databases created before the versioned scrypt format.
+    settings = get_settings()
+    legacy = hashlib.sha256(
+        f"{plain_password}:{settings.secret_key.get_secret_value()}".encode()
+    ).hexdigest()
+    return hmac.compare_digest(legacy, hashed_password)
+
+
+def password_hash_needs_upgrade(password_hash: str) -> bool:
+    return not password_hash.startswith(f"{PASSWORD_HASH_SCHEME}$")
 
 
 def _jwt_signing_key() -> bytes:
@@ -75,7 +115,7 @@ def create_access_token(
     user: UserDTO,
     *,
     token_version: int,
-    expires_in_days: int = 30,
+    expires_in_days: int = 1,
 ) -> str:
     """Create a signed access token with explicit issuer, audience, and expiry claims."""
     now = datetime.now(UTC)
