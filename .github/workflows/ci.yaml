@@ -84,11 +84,11 @@ jobs:
           cache-to: type=gha,mode=max,scope=web
       - name: Gateway smoke test
         run: |
-          docker run --rm -d --name mcp-pool-smoke \
+          docker run -d --name mcp-pool-smoke \
             -e MCP_POOL_ENVIRONMENT=test \
             -e MCP_POOL_SECRET_KEY=ci-only-secret \
             -p 127.0.0.1:18000:8000 mcp-pool:test
-          trap 'docker stop mcp-pool-smoke' EXIT
+          trap 'docker rm -f mcp-pool-smoke >/dev/null 2>&1 || true' EXIT
           for attempt in {1..20}; do
             if curl --fail --silent http://127.0.0.1:18000/health/ready; then
               exit 0

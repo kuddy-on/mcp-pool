@@ -45,3 +45,22 @@ def test_default_command_uses_settings(monkeypatch: MonkeyPatch) -> None:
     assert result.exit_code == 0
     assert calls[0]["host"] == "127.0.0.1"
     assert calls[0]["port"] == 8000
+
+
+def test_reset_password_prompts_without_exposing_secret(monkeypatch: MonkeyPatch) -> None:
+    calls: list[tuple[str, str]] = []
+
+    async def fake_reset(username: str, password: str) -> bool:
+        calls.append((username, password))
+        return True
+
+    monkeypatch.setattr(cli, "_reset_user_password", fake_reset)
+    result = CliRunner().invoke(
+        cli.app,
+        ["reset-password", "admin"],
+        input="a-new-secure-password\na-new-secure-password\n",
+    )
+
+    assert result.exit_code == 0
+    assert calls == [("admin", "a-new-secure-password")]
+    assert "a-new-secure-password" not in result.output

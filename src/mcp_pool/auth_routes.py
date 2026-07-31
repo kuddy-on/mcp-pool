@@ -15,7 +15,6 @@ from mcp_pool.auth import (
     create_access_token,
     get_current_user,
     hash_password,
-    password_hash_needs_upgrade,
     require_admin,
     verify_password,
 )
@@ -111,9 +110,6 @@ async def login(req: LoginRequest, request: Request) -> LoginResponse:
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Incorrect username or password",
             )
-        if password_hash_needs_upgrade(user.password_hash):
-            user.password_hash = hash_password(req.password)
-            await session.commit()
         await _clear_login_failures(client_id)
 
         user_dto = UserDTO(id=user.id, username=user.username, role=user.role)

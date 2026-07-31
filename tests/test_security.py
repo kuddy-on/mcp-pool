@@ -79,6 +79,7 @@ def test_password_hashes_are_salted_and_memory_hard() -> None:
     assert first != second
     assert verify_password("correct horse battery staple", first)
     assert not verify_password("wrong password", first)
+    assert not verify_password("legacy password", "f" * 64)
 
 
 def test_production_rejects_default_or_short_application_secrets() -> None:

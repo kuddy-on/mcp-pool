@@ -29,6 +29,18 @@ Schema changes are versioned in `schema_migrations` and applied in order during 
 failure stops startup and is not marked complete. To roll application code back after a schema
 upgrade, restore the pre-upgrade database backup; down migrations are intentionally not automated.
 
+### Password-hash upgrade
+
+MCPPool accepts only versioned scrypt password hashes. Databases created by releases that used
+legacy password digests must reset each affected account before upgrading:
+
+```bash
+docker compose run --rm gateway mcp-pool reset-password admin
+```
+
+The command reads the new password from a hidden confirmation prompt, stores a salted scrypt hash,
+and revokes existing access tokens. It never accepts the password as a command-line argument.
+
 ## Secret rotation
 
 The application secret currently protects credential encryption, JWT signing, and Gateway-key
