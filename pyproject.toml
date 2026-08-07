@@ -19,17 +19,17 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
-  "aiosqlite>=0.20,<1",
-  "cryptography>=48.0.1,<49",
-  "fastapi>=0.115,<1",
-  "httpx[http2]>=0.28,<1",
-  "prometheus-client>=0.21,<1",
-  "pyjwt>=2.10,<3",
-  "pydantic-settings>=2.7,<3",
-  "sqlalchemy[asyncio]>=2.0,<3",
-  "structlog>=24,<26",
-  "typer>=0.15,<1",
-  "uvicorn[standard]>=0.34,<1",
+  "aiosqlite>=0.22.1,<1",
+  "cryptography>=50.0.0,<51",
+  "fastapi>=0.141.1,<1",
+  "httpx[http2]>=0.28.1,<1",
+  "prometheus-client>=0.26.0,<1",
+  "pyjwt>=2.13.0,<3",
+  "pydantic-settings>=2.14.2,<3",
+  "sqlalchemy[asyncio]>=2.0.51,<3",
+  "structlog>=26.1.0,<27",
+  "typer>=0.27.1,<1",
+  "uvicorn[standard]>=0.52.1,<1",
 ]
 
 [project.urls]
@@ -43,11 +43,11 @@ mcp-pool = "mcp_pool.cli:app"
 
 [dependency-groups]
 dev = [
-  "mypy>=1.14,<2",
-  "pytest>=8.3,<9",
-  "pytest-asyncio>=0.25,<1",
-  "pytest-cov>=6,<8",
-  "ruff>=0.9,<1",
+  "mypy>=2.3.0,<3",
+  "pytest>=9.1.1,<10",
+  "pytest-asyncio>=1.4.0,<2",
+  "pytest-cov>=7.1.0,<8",
+  "ruff>=0.16.1,<1",
 ]
 
 [tool.hatch.build.targets.wheel]
